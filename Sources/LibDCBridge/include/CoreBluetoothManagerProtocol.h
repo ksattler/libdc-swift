@@ -12,6 +12,8 @@
 - (BOOL)enableNotifications;
 - (BOOL)writeData:(NSData *)data;
 - (NSData *)readDataPartial:(int)requested;
+- (NSData *)readCharacteristicByUUID:(NSString *)uuid timeout:(double)seconds;
+- (void)setReadTimeout:(int)milliseconds;
 - (void)close;
 @end
 

@@ -1,5 +1,6 @@
 #import "BLEBridge.h"
 #import <Foundation/Foundation.h>
+#include <libdivecomputer/ble.h>
 
 static id<CoreBluetoothManagerProtocol> bleManager = nil;
 
@@ -85,11 +86,55 @@ bool enableNotifications(ble_object_t *io) {
 }
 
 dc_status_t ble_set_timeout(ble_object_t *io, int timeout) {
+    // Forward the backend's requested read timeout to the BLE manager. libdivecomputer
+    // backends (e.g. uwatec_smart) set this to 5000ms; ignoring it left reads capped at a
+    // hardcoded 3s, causing DC_STATUS_IO when a device paused mid-download.
+    Class CoreBluetoothManagerClass = NSClassFromString(@"CoreBluetoothManager");
+    id<CoreBluetoothManagerProtocol> manager = [CoreBluetoothManagerClass shared];
+    [manager setReadTimeout:timeout];
     return DC_STATUS_SUCCESS;
 }
 
 dc_status_t ble_ioctl(ble_object_t *io, unsigned int request, void *data, size_t size) {
-    return DC_STATUS_UNSUPPORTED;
+    if (!io) {
+        return DC_STATUS_INVALIDARGS;
+    }
+
+    Class CoreBluetoothManagerClass = NSClassFromString(@"CoreBluetoothManager");
+    id<CoreBluetoothManagerProtocol> manager = [CoreBluetoothManagerClass shared];
+
+    switch (request) {
+    case DC_IOCTL_BLE_CHARACTERISTIC_READ: {
+        // Request layout: [16-byte big-endian UUID][N-byte read buffer], size = 16 + N.
+        // libdivecomputer (e.g. cressi_goa) reads serial/model/firmware this way and expects
+        // exactly N bytes copied back into the buffer in place, after the UUID prefix.
+        if (!data || size < sizeof(dc_ble_uuid_t)) {
+            return DC_STATUS_INVALIDARGS;
+        }
+
+        char uuidstr[DC_BLE_UUID_SIZE] = {0};
+        if (dc_ble_uuid2str((const unsigned char *)data, uuidstr, sizeof(uuidstr)) == NULL) {
+            return DC_STATUS_INVALIDARGS;
+        }
+
+        size_t want = size - sizeof(dc_ble_uuid_t);
+        NSString *uuid = [NSString stringWithUTF8String:uuidstr];
+        NSData *value = [manager readCharacteristicByUUID:uuid timeout:5.0];
+        if (!value || value.length < want) {
+            return DC_STATUS_IO;
+        }
+
+        memcpy((unsigned char *)data + sizeof(dc_ble_uuid_t), value.bytes, want);
+        return DC_STATUS_SUCCESS;
+    }
+
+    case DC_IOCTL_BLE_GET_NAME:
+        // Not required by currently supported computers; implement if a backend needs it.
+        return DC_STATUS_UNSUPPORTED;
+
+    default:
+        return DC_STATUS_UNSUPPORTED;
+    }
 }
 
 dc_status_t ble_sleep(ble_object_t *io, unsigned int milliseconds) {

@@ -74,6 +74,9 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     private var receivedData: Data = Data()
     private let queue = DispatchQueue(label: "com.blemanager.queue")
     private let dataAvailableSemaphore = DispatchSemaphore(value: 0) // Signals when new data arrives
+    private let writeReadySemaphore = DispatchSemaphore(value: 0) // Signals when peripheral can accept a no-response write
+    private let writeConfirmSemaphore = DispatchSemaphore(value: 0) // Signals when a with-response write completes
+    private var lastWriteError: Error? // Result of the most recent with-response write
     private let frameMarker: UInt8 = 0x7E
     private var _deviceDataPtr: UnsafeMutablePointer<device_data_t>?
     private var connectionCompletion: ((Bool) -> Void)?
@@ -82,6 +85,17 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     private var averageTransferRate: Double = 0
     private var preferredService: CBService?
     private var pendingOperations: [() -> Void] = []
+    /// All characteristics of the preferred service, keyed by lowercased UUID string.
+    /// Used by `readCharacteristic(byUUID:timeout:)` to service BLE characteristic-read ioctls
+    /// (e.g. Cressi reads serial/model/firmware via DC_IOCTL_BLE_CHARACTERISTIC_READ).
+    private var characteristicsByUUID: [String: CBCharacteristic] = [:]
+    /// Result slot for an in-flight explicit characteristic read; accessed under `queue`.
+    private var ioctlReadValue: Data?
+    /// Lowercased UUID of the characteristic an explicit read is currently awaiting; accessed under `queue`.
+    private var ioctlReadCharUUID: String?
+    /// Nordic UART serial service. Cressi advertises both this and its own vendor service,
+    /// but libdivecomputer requires the vendor service, so this must never win preferred-service selection.
+    private let nordicUARTServiceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
     
     // MARK: - Public Properties
     public var openedDeviceDataPtr: UnsafeMutablePointer<device_data_t>? { // Public access to device data pointer with change notification
@@ -107,12 +121,15 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
         SerialService(uuid: "2456e1b9-26e2-8f83-e744-f34f01e9d701", vendor: "Heinrichs-Weikamp", product: "U-Blox"),
         SerialService(uuid: "544e326b-5b72-c6b0-1c46-41c1bc448118", vendor: "Mares", product: "BlueLink Pro"),
         SerialService(uuid: "6e400001-b5a3-f393-e0a9-e50e24dcca9e", vendor: "Nordic Semi", product: "UART"),
+        SerialService(uuid: "6e400001-b5a3-f393-e0a9-e50e24dc10b8", vendor: "Cressi", product: "Goa"),
         SerialService(uuid: "98ae7120-e62e-11e3-badd-0002a5d5c51b", vendor: "Suunto", product: "EON Steel/Core"),
         SerialService(uuid: "cb3c4555-d670-4670-bc20-b61dbc851e9a", vendor: "Pelagic", product: "i770R/i200C"),
         SerialService(uuid: "ca7b0001-f785-4c38-b599-c7c5fbadb034", vendor: "Pelagic", product: "i330R/DSX"),
         SerialService(uuid: "fdcdeaaa-295d-470e-bf15-04217b7aa0a0", vendor: "ScubaPro", product: "G2/G3"),
         SerialService(uuid: "fe25c237-0ece-443c-b0aa-e02033e7029d", vendor: "Shearwater", product: "Perdix/Teric"),
-        SerialService(uuid: "0000fcef-0000-1000-8000-00805f9b34fb", vendor: "Divesoft", product: "Freedom")
+        SerialService(uuid: "0000fcef-0000-1000-8000-00805f9b34fb", vendor: "Divesoft", product: "Freedom"),
+        SerialService(uuid: "00000001-8c3b-4f2c-a59e-8c08224f3253", vendor: "Halcyon", product: "Symbios"),
+        SerialService(uuid: "84968ffe-d26d-478a-b953-5010bcf58bca", vendor: "Seac", product: "Screen")
     ]
     
     /// Service UUIDs to exclude from discovery
@@ -219,14 +236,63 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     @objc public func write(_ data: Data!) -> Bool {
         guard let peripheral = self.peripheral,
               let characteristic = self.writeCharacteristic else { return false }
-        peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
-        return true
+        // Choose the write type from the characteristic's properties rather than always using
+        // .withoutResponse. A characteristic that only supports Write (with response) silently
+        // drops .withoutResponse writes on CoreBluetooth. Prefer .withoutResponse when available
+        // (preserves behavior for devices that work today), else fall back to .withResponse.
+        // Matches Subsurface (qt-ble.cpp) and submersion (BleIoStream.swift).
+        let writeType: CBCharacteristicWriteType =
+            characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+
+        // Per-write deadline from the backend-requested timeout (falls back to 3s).
+        let timeoutMs = self.timeout > 0 ? self.timeout : 3000
+
+        if writeType == .withoutResponse {
+            // Don't overrun CoreBluetooth's transmit queue: wait until it can accept a
+            // no-response write, otherwise the write is silently dropped during bursts.
+            if !peripheral.canSendWriteWithoutResponse {
+                drainSemaphore(writeReadySemaphore)
+                if writeReadySemaphore.wait(timeout: .now() + .milliseconds(timeoutMs)) == .timedOut {
+                    logWarning("Write blocked waiting for canSendWriteWithoutResponse")
+                    return false
+                }
+            }
+            peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+            return true
+        } else {
+            // With-response write: wait for the didWriteValueFor confirmation.
+            drainSemaphore(writeConfirmSemaphore)
+            lastWriteError = nil
+            peripheral.writeValue(data, for: characteristic, type: .withResponse)
+            if writeConfirmSemaphore.wait(timeout: .now() + .milliseconds(timeoutMs)) == .timedOut {
+                logWarning("Write withResponse timed out")
+                return false
+            }
+            if let error = lastWriteError {
+                logError("Write withResponse failed: \(error.localizedDescription)")
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Drains any pending signals from a semaphore so the next wait reflects only new events.
+    private func drainSemaphore(_ semaphore: DispatchSemaphore) {
+        while semaphore.wait(timeout: .now()) == .success { }
     }
     
+    /// Sets the per-read timeout (milliseconds) requested by the libdivecomputer backend.
+    /// A non-positive value means "no timeout was set"; `readDataPartial` then uses its default.
+    @objc public func setReadTimeout(_ milliseconds: Int32) {
+        self.timeout = Int(milliseconds)
+    }
+
     @objc public func readDataPartial(_ requested: Int32) -> Data? {
         let requestedInt = Int(requested)
         let startTime = Date()
-        let timeout: TimeInterval = 3.0
+        // Honor the timeout the backend requested via dc_iostream_set_timeout; fall back to 3s
+        // when unset (timeout < 0). Previously this was hardcoded to 3s, ignoring the backend.
+        let timeout: TimeInterval = self.timeout > 0 ? Double(self.timeout) / 1000.0 : 3.0
 
         while Date().timeIntervalSince(startTime) < timeout {
             var outData: Data?
@@ -265,6 +331,9 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             if !receivedData.isEmpty {
                 receivedData.removeAll()
             }
+            characteristicsByUUID.removeAll()
+            ioctlReadValue = nil
+            ioctlReadCharUUID = nil
         }
 
         // Drain and signal semaphore to unblock any waiting reads and clear stale signals
@@ -509,17 +578,32 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             return
         }
         
+        // Choose the preferred service across all matches before binding characteristics.
+        // A vendor-specific service always wins over the generic Nordic UART service:
+        // Cressi advertises both Nordic UART (…CA9E) and its own service (…10B8), and
+        // libdivecomputer requires the vendor service.
+        var chosen: CBService?
+        var chosenIsNordic = false
         for service in services {
             if isExcludedService(service.uuid) {
                 continue
             }
-            
+
             if let knownService = isKnownSerialService(service.uuid) {
-                preferredService = service
-                writeCharacteristic = nil
-                notifyCharacteristic = nil
+                let isNordic = knownService.uuid.lowercased() == nordicUARTServiceUUID
+                if chosen == nil || (chosenIsNordic && !isNordic) {
+                    chosen = service
+                    chosenIsNordic = isNordic
+                }
             }
             peripheral.discoverCharacteristics(nil, for: service)
+        }
+
+        if let chosen = chosen {
+            preferredService = chosen
+            writeCharacteristic = nil
+            notifyCharacteristic = nil
+            queue.sync { characteristicsByUUID.removeAll() }
         }
     }
 
@@ -534,11 +618,22 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             return
         }
         
+        // When a known serial service was identified, only bind streaming characteristics
+        // from that preferred service (avoids grabbing Nordic UART characteristics on Cressi,
+        // which exposes both services). If no known service matched, fall back to scanning all.
+        if let preferred = preferredService, service != preferred {
+            return
+        }
+
         for characteristic in characteristics {
+            queue.sync {
+                characteristicsByUUID[characteristic.uuid.uuidString.lowercased()] = characteristic
+            }
+
             if isWriteCharacteristic(characteristic) {
                 writeCharacteristic = characteristic
             }
-            
+
             if isReadCharacteristic(characteristic) {
                 notifyCharacteristic = characteristic
                 peripheral.setNotifyValue(true, for: characteristic)
@@ -556,9 +651,22 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             return
         }
         
+        var handledAsIoctlRead = false
         queue.sync {
-            // Append new data to our buffer immediately
-            receivedData.append(data)
+            // Route the value of an explicitly requested characteristic read (e.g. the Cressi
+            // serial/model/firmware characteristics) to the ioctl slot instead of the SLIP stream.
+            if let want = ioctlReadCharUUID,
+               characteristic.uuid.uuidString.lowercased() == want {
+                ioctlReadValue = data
+                handledAsIoctlRead = true
+            } else {
+                // Append new data to our buffer immediately
+                receivedData.append(data)
+            }
+        }
+
+        if handledAsIoctlRead {
+            return
         }
 
         // Signal that data is available - wake up any waiting read
@@ -567,10 +675,56 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
         updateTransferStats(data.count)
     }
 
+    /// Synchronously reads a single characteristic value by UUID. Used by `ble_ioctl`
+    /// to service DC_IOCTL_BLE_CHARACTERISTIC_READ (Cressi serial/model/firmware reads).
+    /// Mirrors the RunLoop-polling pattern used by `discoverServices`.
+    /// - Returns: the characteristic value, or nil on timeout / not-found / not-connected.
+    @objc(readCharacteristicByUUID:timeout:)
+    public func readCharacteristic(byUUID uuidString: String, timeout seconds: Double) -> Data? {
+        guard let peripheral = self.peripheral, peripheral.state == .connected else {
+            logError("No connected peripheral for characteristic read")
+            return nil
+        }
+
+        let key = uuidString.lowercased()
+        guard let characteristic = queue.sync(execute: { characteristicsByUUID[key] }) else {
+            logError("Characteristic \(uuidString) not found in preferred service")
+            return nil
+        }
+
+        queue.sync {
+            ioctlReadValue = nil
+            ioctlReadCharUUID = key
+        }
+        peripheral.readValue(for: characteristic)
+
+        let deadline = Date(timeIntervalSinceNow: seconds)
+        while true {
+            var result: Data?
+            queue.sync { result = ioctlReadValue }
+            if let result = result {
+                queue.sync { ioctlReadValue = nil; ioctlReadCharUUID = nil }
+                return result
+            }
+            if Date() > deadline {
+                queue.sync { ioctlReadCharUUID = nil }
+                logError("Timeout reading characteristic \(uuidString)")
+                return nil
+            }
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+    }
+
     public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        lastWriteError = error
         if let error = error {
             logError("Error writing to characteristic: \(error.localizedDescription)")
         }
+        writeConfirmSemaphore.signal()
+    }
+
+    public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        writeReadySemaphore.signal()
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
