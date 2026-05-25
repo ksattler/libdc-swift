@@ -279,7 +279,12 @@
 	 dc_device_t *abstract = (dc_device_t *) device;
 	 dc_status_t status = DC_STATUS_SUCCESS;
 	 unsigned int length = osize;
- 
+	 // Set to non-zero by the DIVE branch when the trailing ready byte
+	 // (0x4D) was already consumed together with the profile data in the
+	 // same BLE notification. The post-read "Read the ready byte" step is
+	 // then skipped, since the byte is no longer pending on the wire.
+	 int ready_already_consumed = 0;
+
 	 if (cmd == DIVE && length < RB_LOGBOOK_SIZE_FULL)
 		 return DC_STATUS_INVALIDARGS;
  
@@ -363,14 +368,135 @@
 				 length = RB_LOGBOOK_SIZE_FULL + 5;
 			 }
  
-			 // Read the dive profile.
-			 status = hw_ostc3_read (device, progress, output + RB_LOGBOOK_SIZE_FULL, length - RB_LOGBOOK_SIZE_FULL);
-			 if (status != DC_STATUS_SUCCESS) {
-				 ERROR (abstract->context, "Failed to receive the dive profile.");
-				 return status;
+			 // Read the dive profile in chunks, stopping as soon as we see the
+			 // FD FD end-of-profile marker. The `length` value derived from the
+			 // logbook header is sometimes off (especially on OSTC 4/5 firmware
+			 // variants) -- relying on it strictly causes the read to time out
+			 // for dives whose actual byte stream is a few bytes shorter or
+			 // longer than the header advertises. Marker-based termination
+			 // makes the read robust against those discrepancies.
+			 {
+				 size_t profile_max = length - RB_LOGBOOK_SIZE_FULL;
+				 size_t got = 0;
+				 unsigned char *pbuf = output + RB_LOGBOOK_SIZE_FULL;
+				 dc_status_t pstatus = DC_STATUS_SUCCESS;
+				 while (got < profile_max) {
+					 size_t chunk = profile_max - got;
+					 if (chunk > 1024) chunk = 1024;
+					 size_t got_now = 0;
+					 pstatus = dc_iostream_read (device->iostream, pbuf + got, chunk, &got_now);
+					 got += got_now;
+					 // Marker check runs regardless of pstatus: the packet wrapper
+					 // may return DC_STATUS_IO together with the final bytes of the
+					 // profile (timeout on the next, never-sent BLE packet). We
+					 // accept that case as a normal end-of-profile.
+					 if (got >= 3 &&
+						 pbuf[got - 3] == 0xFD &&
+						 pbuf[got - 2] == 0xFD &&
+						 pbuf[got - 1] == ready) {
+						 got -= 1;
+						 ready_already_consumed = 1;
+						 break;
+					 }
+					 if (got >= 2 && pbuf[got - 2] == 0xFD && pbuf[got - 1] == 0xFD) {
+						 break;
+					 }
+					 // Heuristic: a 0x4D right after >= 2 zero bytes of padding is
+					 // almost certainly the Done marker for a corrupt-but-terminated
+					 // profile (no FD FD end marker). Without this check the 0x4D
+					 // would be swallowed into the profile buffer and the loop would
+					 // keep reading garbage from the next response until profile_max,
+					 // then fail the final marker check.
+					 if (got >= 3 && pbuf[got - 1] == ready &&
+						 pbuf[got - 2] == 0x00 && pbuf[got - 3] == 0x00) {
+						 got -= 1;
+						 ready_already_consumed = 1;
+						 break;
+					 }
+					 if (pstatus != DC_STATUS_SUCCESS) break;
+				 }
+				 // Post-loop marker handling. Two valid outcomes:
+				 //   * FD FD + ready    -> profile complete, Done already consumed
+				 //   * FD FD             -> profile complete, Done still pending
+				 // Anything else is a corrupt/short profile. We still treat it as
+				 // 'end of response' as long as the ready byte (0x4D) was the
+				 // final byte received, because libdc's foreach loop (see line
+				 // ~910 in hw_ostc3_device_foreach) has its own validation that
+				 // recognises an invalid profile-end marker and falls back to
+				 // 'header only'. Failing hard here would prevent that recovery
+				 // path and abort the whole download.
+				 if (!ready_already_consumed && got >= 3 &&
+					 pbuf[got - 3] == 0xFD &&
+					 pbuf[got - 2] == 0xFD &&
+					 pbuf[got - 1] == ready) {
+					 got -= 1;
+					 ready_already_consumed = 1;
+				 } else if (!ready_already_consumed && got >= 1 && pbuf[got - 1] == ready) {
+					 // Stream ended on Done without a valid FD FD marker. Hand an
+					 // empty/short profile up to the validation step.
+					 WARNING (abstract->context, "Profile end marker missing, accepting truncated profile.");
+					 got -= 1;
+					 ready_already_consumed = 1;
+				 } else if (!ready_already_consumed && got > 3) {
+					 // Backward scan: find the last occurrence of the Done marker in
+					 // the buffer. Some OSTC firmwares pad a corrupt profile with
+					 // arbitrary bytes (which may even resemble valid profile data)
+					 // AFTER the Done marker. Without this scan the 0x4D gets buried
+					 // inside the profile buffer and the loop reads garbage from the
+					 // next command until profile_max, then fails the final marker.
+					 // We try the strict pattern <00 00 4D> first, then fall back to
+					 // the last bare 0x4D in the trailing 256 bytes.
+					 size_t found = 0;
+					 for (size_t i = got; i > 3; i--) {
+					 	if (pbuf[i - 1] == ready &&
+					 	    pbuf[i - 2] == 0x00 &&
+					 	    pbuf[i - 3] == 0x00) {
+					 		found = i;
+					 		break;
+					 	}
+					 }
+					 if (!found) {
+					 	size_t lo = got > 256 ? got - 256 : 1;
+					 	for (size_t i = got; i > lo; i--) {
+					 		if (pbuf[i - 1] == ready) {
+					 			found = i;
+					 			break;
+					 		}
+					 	}
+					 }
+					 if (found) {
+					 	WARNING (abstract->context, "Done marker found %zu bytes from end of profile buffer, trimming.", got - found);
+					 	got = found - 1;
+					 	ready_already_consumed = 1;
+					 	// Some OSTC firmwares emit junk bytes (often more 0x4D padding)
+					 	// AFTER the Done marker. Flush whatever the BLE layer has cached
+					 	// so the next command's echo doesn't pick up leftover bytes.
+					 	dc_iostream_purge (device->iostream, DC_DIRECTION_INPUT);
+					 }
+				 }
+				 if (got < 2 || pbuf[got - 2] != 0xFD || pbuf[got - 1] != 0xFD) {
+					 // No valid FD FD at the end. We never positively identified the
+					 // Done byte either. Rather than abort the whole download, we
+					 // (a) treat the ready byte as already consumed so the caller
+					 //     doesn't try to read another byte that may never come, and
+					 // (b) purge whatever junk the OSTC may have appended so the
+					 //     next command's echo arrives uncontaminated.
+					 // The outer foreach validation step (line ~910) detects the
+					 // missing FD FD and falls back to a header-only response.
+					 if (!ready_already_consumed) {
+					 	WARNING (abstract->context, "No FD FD marker (got=%zu, last3=%02x %02x %02x). Treating as terminated, purging stream.", got, got>=3?pbuf[got-3]:0, got>=2?pbuf[got-2]:0, got>=1?pbuf[got-1]:0);
+					 	ready_already_consumed = 1;
+					 	dc_iostream_purge (device->iostream, DC_DIRECTION_INPUT);
+					 }
+				 }
+				 length = RB_LOGBOOK_SIZE_FULL + (unsigned int)got;
+				 if (progress) {
+					 device_event_emit ((dc_device_t *) device, DC_EVENT_PROGRESS, progress);
+				 }
 			 }
- 
-			 // Update and emit a progress event.
+
+			 // Update and emit a progress event for the unused tail of the
+			 // pre-allocated buffer (if the dive ended up shorter than osize).
 			 if (progress && osize > length) {
 				 progress->current += osize - length;
 				 device_event_emit ((dc_device_t *) device, DC_EVENT_PROGRESS, progress);
@@ -389,7 +515,7 @@
 		 dc_iostream_poll (device->iostream, delay);
 	 }
  
-	 if (cmd != EXIT) {
+	 if (cmd != EXIT && !ready_already_consumed) {
 		 // Read the ready byte.
 		 unsigned char answer[1] = {0};
 		 status = dc_iostream_read (device->iostream, answer, sizeof (answer), NULL);
@@ -833,10 +959,24 @@
 			 if (firmware < OSTC3FW(0,93))
 				 length -= 3;
 		 }
+		 // OSTC 4/5 firmware stores the profile length in the (compact) dive
+		 // header 3 bytes higher than what is actually transmitted in the dive
+		 // download response. The same delta is already encoded for the
+		 // post-download validation step (see `delta = ISHWOS4(...) ? 3 : 0`).
+		 // Without this correction the read of the dive profile expects 3 more
+		 // bytes than the OSTC sends and times out with DC_STATUS_IO.
+		 if (ISHWOS4(device->hardware))
+			 length -= 3;
 		 if (length < RB_LOGBOOK_SIZE_FULL) {
-			 ERROR (abstract->context, "Invalid profile length (%u bytes).", length);
-			 free (header);
-			 return DC_STATUS_DATAFORMAT;
+			 WARNING (abstract->context, "Skipping dive entry %u: profile length too small (%u bytes).", idx, length);
+			 continue;
+		 }
+		 // Guard against corrupt headers with an implausibly large profile
+		 // length (e.g. flash-erased slots with non-0xFF residue). Requesting
+		 // such a transfer from the OSTC4/5 causes the firmware to disconnect.
+		 if (length > SZ_MEMORY) {
+			 WARNING (abstract->context, "Skipping dive entry %u: profile length (%u bytes) exceeds flash size.", idx, length);
+			 continue;
 		 }
  
 		 // Check the fingerprint data.
@@ -881,6 +1021,14 @@
 			 if (firmware < OSTC3FW(0,93))
 				 length -= 3;
 		 }
+		 // OSTC 4/5 firmware stores the profile length in the (compact) dive
+		 // header 3 bytes higher than what is actually transmitted in the dive
+		 // download response. The same delta is already encoded for the
+		 // post-download validation step (see `delta = ISHWOS4(...) ? 3 : 0`).
+		 // Without this correction the read of the dive profile expects 3 more
+		 // bytes than the OSTC sends and times out with DC_STATUS_IO.
+		 if (ISHWOS4(device->hardware))
+			 length -= 3;
  
 		 // Download the dive.
 		 unsigned char number[1] = {idx};
