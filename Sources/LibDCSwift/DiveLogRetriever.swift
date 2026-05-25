@@ -11,6 +11,10 @@ public class DiveLogRetriever {
         var logCount: Int = 1
         let viewModel: DiveDataViewModel
         var lastFingerprint: Data?
+        /// Fingerprint of the most recently processed dive (the oldest of all dives downloaded
+        /// so far). Used to save a partial fingerprint on IO-abort so the next connection skips
+        /// already-downloaded dives and avoids re-requesting the failing slot.
+        var lastDownloadedFingerprint: Data?
         let deviceName: String
         let deviceUUID: String
         var deviceSerial: String?
@@ -153,8 +157,9 @@ public class DiveLogRetriever {
             }
             
             context.hasNewDives = true
+            context.lastDownloadedFingerprint = fingerprintData  // track oldest successfully downloaded
             context.logCount += 1
-            return 1  
+            return 1
         } catch {
             logError("❌ Failed to parse dive #\(context.logCount): \(error)")
             return 1 
@@ -182,24 +187,23 @@ public class DiveLogRetriever {
            let typeStr = deviceType.map({ String(cString: $0) }) {
              
              if let fingerprint = viewModel.getFingerprint(forDeviceType: typeStr, serial: serialStr) {
-                // Sanity check: Shearwater fingerprints should be exactly 4 bytes
-                if fingerprint.count != 4 {
-                    logWarning("⚠️ Fingerprint size mismatch! Expected 4 bytes, got \(fingerprint.count)")
-                }
-
                 size.pointee = fingerprint.count
-                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: fingerprint.count)
+                // Allocate via C malloc so the bridge can pair this with free()
+                // when close_device_data() runs (allocator must match).
+                guard let raw = malloc(fingerprint.count) else { return nil }
+                let buffer = raw.assumingMemoryBound(to: UInt8.self)
                 fingerprint.copyBytes(to: buffer, count: fingerprint.count)
                 return buffer
             } else {
-                // No stored fingerprint - return a sentinel value (0xFFFFFFFF) that won't match any real dive
-                // This is necessary because libdivecomputer defaults to 0x00000000 if no fingerprint is set,
-                // which could accidentally match a dive with fingerprint 0x00000000 and stop enumeration
-                let sentinelFingerprint: [UInt8] = [0xFF, 0xFF, 0xFF, 0xFF]
-                size.pointee = sentinelFingerprint.count
-                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: sentinelFingerprint.count)
-                buffer.initialize(from: sentinelFingerprint, count: sentinelFingerprint.count)
-                return buffer
+                // No stored fingerprint: return NULL so the bridge does not call
+                // dc_device_set_fingerprint(). Returning a fixed-size sentinel
+                // breaks Oceanic/Pelagic families that require larger fingerprints
+                // (i330R = 64 bytes, DSX = 512 bytes) and only Shearwater uses 4.
+                // libdivecomputer's default zero-fingerprint is unlikely to collide
+                // with any real dive, and the real fingerprint is stored after the
+                // first successful download.
+                size.pointee = 0
+                return nil
             }
         } else {
             logWarning("⚠️ Fingerprint lookup called with nil device type or serial")
@@ -326,15 +330,38 @@ public class DiveLogRetriever {
                         }
                         
                     default:
-                        // Any other error status
+                        // Any other error status (e.g. DC_STATUS_IO from BLE disconnect mid-download)
                         downloadSucceeded = false
                         shouldSaveFingerprint = false
+                        // Partial-download recovery: if some dives were downloaded before the
+                        // failure, save the fingerprint of the OLDEST successfully received dive.
+                        // On the next connection the pre-scan stops just before that slot so the
+                        // failing ring-buffer entry is skipped automatically.
+                        if context.hasNewDives,
+                           let lastFP = context.lastDownloadedFingerprint,
+                           let serial = context.deviceSerial {
+                            let deviceType: String
+                            if let stored = DeviceStorage.shared.getStoredDevice(uuid: context.deviceUUID),
+                               let modelInfo = DeviceConfiguration.supportedModels.first(where: { $0.modelID == stored.model && $0.family == stored.family }) {
+                                deviceType = modelInfo.name
+                            } else {
+                                deviceType = context.deviceTypeFromLibDC ?? context.deviceName
+                            }
+                            logInfo("⚠️ Partial download (\(context.logCount - 1) dives): saving partial fingerprint to skip failing slot on next connect.")
+                            viewModel.saveFingerprint(lastFP, deviceType: deviceType, serial: serial)
+                        }
                     }
-                    
+
                     // Handle the outcome
                     if !downloadSucceeded {
-                        viewModel.setDetailedError("Download incomplete - DC_STATUS error code: \(enumStatus)", status: enumStatus)
-                        completion(false)
+                        DispatchQueue.main.async {
+                            let savedCount = context.logCount - 1
+                            let msg = savedCount > 0
+                                ? "Download unterbrochen nach \(savedCount) Tauchgang/Tauchgängen. Erneut verbinden um weitere zu laden."
+                                : "Download fehlgeschlagen - DC_STATUS Fehlercode: \(enumStatus)"
+                            viewModel.setDetailedError(msg, status: enumStatus)
+                            completion(false)
+                        }
                     } else {
                         // Download completed successfully
                         if shouldSaveFingerprint, let lastFP = context.lastFingerprint, let serial = context.deviceSerial {
@@ -348,17 +375,25 @@ public class DiveLogRetriever {
                                 deviceType = context.deviceTypeFromLibDC ?? context.deviceName
                             }
                             logInfo("✅ Download completed - \(context.logCount - 1) dive(s) downloaded")
-                            viewModel.saveFingerprint(lastFP, deviceType: deviceType, serial: serial)
-                            viewModel.finalizeDiveNumbering()  // Sort by date and renumber (oldest = #1)
-                            viewModel.updateProgress(.completed)
+                            DispatchQueue.main.async {
+                                viewModel.saveFingerprint(lastFP, deviceType: deviceType, serial: serial)
+                                viewModel.finalizeDiveNumbering()
+                                viewModel.updateProgress(.completed)
+                                completion(true)
+                            }
                         } else if context.fingerprintMatched || (context.storedFingerprint != nil && !context.hasNewDives) {
                             logInfo("ℹ️ No new dives found")
-                            viewModel.updateProgress(.noNewDives)
+                            DispatchQueue.main.async {
+                                viewModel.updateProgress(.noNewDives)
+                                completion(true)
+                            }
                         } else {
-                            viewModel.finalizeDiveNumbering()  // Sort by date and renumber (oldest = #1)
-                            viewModel.updateProgress(.completed)
+                            DispatchQueue.main.async {
+                                viewModel.finalizeDiveNumbering()
+                                viewModel.updateProgress(.completed)
+                                completion(true)
+                            }
                         }
-                        completion(true)
                     }
                     
                     context.isCompleted = true
