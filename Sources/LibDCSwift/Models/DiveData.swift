@@ -84,6 +84,9 @@ public struct DiveProfilePoint {
     public let bearing: UInt32?       // Compass heading (degrees)
     public let setpoint: Double?      // CCR setpoint
 
+    // Dive mode at this sample point (tracks DC_SAMPLE_DIVEMODE changes)
+    public let diveMode: DiveData.DiveMode?
+
     public init(
         time: TimeInterval,
         depth: Double,
@@ -102,7 +105,8 @@ public struct DiveProfilePoint {
         rbt: UInt32? = nil,
         heartbeat: UInt32? = nil,
         bearing: UInt32? = nil,
-        setpoint: Double? = nil
+        setpoint: Double? = nil,
+        diveMode: DiveData.DiveMode? = nil
     ) {
         self.time = time
         self.depth = depth
@@ -122,6 +126,7 @@ public struct DiveProfilePoint {
         self.heartbeat = heartbeat
         self.bearing = bearing
         self.setpoint = setpoint
+        self.diveMode = diveMode
     }
 }
 
@@ -130,12 +135,23 @@ public struct GasMix {
     public let oxygen: Double
     public let nitrogen: Double
     public let usage: dc_usage_t
-    
+
     public init(helium: Double, oxygen: Double, nitrogen: Double, usage: dc_usage_t) {
         self.helium = helium
         self.oxygen = oxygen
         self.nitrogen = nitrogen
         self.usage = usage
+    }
+
+    /// Convenience init for consumers that can't reference dc_usage_t directly.
+    /// usageRaw: 0=none(OC), 1=O₂(CCR), 2=diluent(CCR), 3=sidemount
+    public init(oxygenFraction: Double, heliumFraction: Double, usageRaw: UInt32 = 0) {
+        let he = max(0, min(1, heliumFraction))
+        let o2 = max(0, min(1 - he, oxygenFraction))
+        self.helium = he
+        self.oxygen = o2
+        self.nitrogen = max(0, 1.0 - o2 - he)
+        self.usage = dc_usage_t(rawValue: usageRaw)
     }
 }
 
@@ -267,27 +283,33 @@ public struct DiveData: Identifiable {
     public var decoStop: DecoStop?
     
     public struct Tank {
+        public var name: String?
         public var volume: Double
         public var workingPressure: Double
         public var beginPressure: Double
         public var endPressure: Double
         public var gasMix: Int
         public var usage: Usage
-        
+        public var beginTime: TimeInterval?
+        public var endTime: TimeInterval?
+
         public enum Usage {
             case none
             case oxygen
             case diluent
             case sidemount
         }
-        
-        public init(volume: Double, workingPressure: Double, beginPressure: Double, endPressure: Double, gasMix: Int, usage: Usage) {
+
+        public init(name: String? = nil, volume: Double, workingPressure: Double, beginPressure: Double, endPressure: Double, gasMix: Int, usage: Usage, beginTime: TimeInterval? = nil, endTime: TimeInterval? = nil) {
+            self.name = name
             self.volume = volume
             self.workingPressure = workingPressure
             self.beginPressure = beginPressure
             self.endPressure = endPressure
             self.gasMix = gasMix
             self.usage = usage
+            self.beginTime = beginTime
+            self.endTime = endTime
         }
     }
     

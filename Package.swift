@@ -31,7 +31,8 @@ let package = Package(
             cSettings: [
                 .headerSearchPath("include/libdivecomputer"),
                 .headerSearchPath("src"),
-                .define("HAVE_PTHREAD_H")
+                .define("HAVE_PTHREAD_H"),
+                .define("ENABLE_LOGGING")
             ]
         ),
         .target(
@@ -64,9 +65,11 @@ let package = Package(
                 "BLEManager.swift",
                 "Models/DeviceConfiguration.swift",
                 "Models/DiveData.swift",
+                "Models/DiveData+Codable.swift",
                 "Models/StoredDevice.swift",
                 "Models/SampleData.swift",
                 "Models/DeviceFingerprint.swift",
+                "Models/AccessCodeStorage.swift",
                 "ViewModels/DiveDataViewModel.swift",
                 "Parser/GenericParser.swift",
                 "DiveLogRetriever.swift"

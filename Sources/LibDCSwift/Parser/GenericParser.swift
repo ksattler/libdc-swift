@@ -132,10 +132,11 @@ public class GenericParser {
                 rbt: data.rbt,
                 heartbeat: data.heartbeat,
                 bearing: data.bearing,
-                setpoint: data.setpoint
+                setpoint: data.setpoint,
+                diveMode: data.sampleDiveMode
             )
             data.profile.append(point)
-            
+
             // Update maximum time
             data.maxTime = max(data.maxTime, data.time)
             
@@ -230,7 +231,21 @@ public class GenericParser {
         }
         
         let wrapper = SampleDataWrapper()
-        
+
+        // Get dive mode early so it's available for profile points
+        if let modeValue: UInt32 = getField(parser, type: DC_FIELD_DIVEMODE) {
+            let mode: DiveData.DiveMode = switch modeValue {
+            case DC_DIVEMODE_FREEDIVE.rawValue: .freedive
+            case DC_DIVEMODE_GAUGE.rawValue: .gauge
+            case DC_DIVEMODE_OC.rawValue: .openCircuit
+            case DC_DIVEMODE_CCR.rawValue: .closedCircuit
+            case DC_DIVEMODE_SCR.rawValue: .semiClosedCircuit
+            default: .openCircuit
+            }
+            wrapper.data.sampleDiveMode = mode
+            wrapper.data.diveMode = mode
+        }
+
         // Convert wrapper to UnsafeMutableRawPointer
         let wrapperPtr = UnsafeMutableRawPointer(Unmanaged.passRetained(wrapper).toOpaque())
         
@@ -243,11 +258,11 @@ public class GenericParser {
             switch type {
             case DC_SAMPLE_TIME:
                 wrapper.data.time = TimeInterval(value.time) / 1000.0
-                wrapper.addProfilePoint()
-                
+
             case DC_SAMPLE_DEPTH:
                 wrapper.data.depth = value.depth
                 wrapper.data.maxDepth = max(wrapper.data.maxDepth, value.depth)
+                wrapper.addProfilePoint()
                 
             case DC_SAMPLE_PRESSURE:
                 wrapper.data.pressure.append((
@@ -307,7 +322,8 @@ public class GenericParser {
                     rbt: wrapper.data.rbt,
                     heartbeat: wrapper.data.heartbeat,
                     bearing: wrapper.data.bearing,
-                    setpoint: wrapper.data.setpoint
+                    setpoint: wrapper.data.setpoint,
+                    diveMode: wrapper.data.sampleDiveMode
                 )
                 wrapper.data.profile.append(point)
                 
@@ -342,7 +358,7 @@ public class GenericParser {
                 
             case DC_SAMPLE_GASMIX:
                 wrapper.data.gasmix = Int(value.gasmix)
-                
+
             default:
                 break
             }
@@ -355,7 +371,26 @@ public class GenericParser {
         guard samplesStatus == DC_STATUS_SUCCESS else {
             throw ParserError.sampleProcessingFailed(samplesStatus)
         }
-        
+
+        // The device header always stores accurate summary values (maxDepth, divetime,
+        // avgDepth) set by the firmware. Sample-derived values may be 0 (no samples)
+        // or lower than the true maximum (truncated profile). Prefer header values
+        // when available and when they indicate a deeper/longer dive than samples show.
+        if let headerMaxDepth: Double = getField(parser, type: DC_FIELD_MAXDEPTH), headerMaxDepth > 0 {
+            if wrapper.data.maxDepth == 0 || headerMaxDepth > wrapper.data.maxDepth {
+                wrapper.data.maxDepth = headerMaxDepth
+            }
+        }
+        if let headerDivetime: UInt32 = getField(parser, type: DC_FIELD_DIVETIME), headerDivetime > 0 {
+            if wrapper.data.maxTime == 0 || TimeInterval(headerDivetime) > wrapper.data.maxTime {
+                wrapper.data.maxTime = TimeInterval(headerDivetime)
+            }
+        }
+        if wrapper.calculateAverageDepth() == 0,
+           let headerAvgDepth: Double = getField(parser, type: DC_FIELD_AVGDEPTH) {
+            wrapper.data.avgDepth = headerAvgDepth
+        }
+
         // Get gas mix information
         if let gasmixCount: UInt32 = getField(parser, type: DC_FIELD_GASMIX_COUNT) {
             for i in 0..<gasmixCount {
@@ -387,20 +422,8 @@ public class GenericParser {
             wrapper.setDecoModel(decoModel)
         }
         
-        // Get dive mode
-        let diveMode: DiveData.DiveMode
-        if let modeValue: UInt32 = getField(parser, type: DC_FIELD_DIVEMODE) {
-            diveMode = switch modeValue {
-            case DC_DIVEMODE_FREEDIVE.rawValue: .freedive
-            case DC_DIVEMODE_GAUGE.rawValue: .gauge
-            case DC_DIVEMODE_OC.rawValue: .openCircuit
-            case DC_DIVEMODE_CCR.rawValue: .closedCircuit
-            case DC_DIVEMODE_SCR.rawValue: .semiClosedCircuit
-            default: .openCircuit
-            }
-        } else {
-            diveMode = .openCircuit  // Default to OC if not specified
-        }
+        // Dive mode was already fetched before sample processing
+        let diveMode = wrapper.data.diveMode
 
         // Get environmental data fields
         if let salinity: dc_salinity_t = getField(parser, type: DC_FIELD_SALINITY) {
@@ -447,11 +470,12 @@ public class GenericParser {
             throw ParserError.invalidParameters
         }
         
+        let calculatedAvgDepth = wrapper.calculateAverageDepth()
         return DiveData(
             number: diveNumber,
             datetime: date,
             maxDepth: wrapper.data.maxDepth,
-            avgDepth: wrapper.calculateAverageDepth(),
+            avgDepth: calculatedAvgDepth > 0 ? calculatedAvgDepth : wrapper.data.avgDepth,
             divetime: wrapper.data.maxTime,
             temperature: wrapper.data.tempMinimum,
             profile: wrapper.data.profile,
@@ -511,6 +535,17 @@ public class GenericParser {
         }
     }
     
+    private static func convertDiveMode(_ rawMode: dc_divemode_t) -> DiveData.DiveMode {
+        switch rawMode {
+        case DC_DIVEMODE_FREEDIVE:  return .freedive
+        case DC_DIVEMODE_GAUGE:     return .gauge
+        case DC_DIVEMODE_OC:        return .openCircuit
+        case DC_DIVEMODE_CCR:       return .closedCircuit
+        case DC_DIVEMODE_SCR:       return .semiClosedCircuit
+        default:                    return .openCircuit
+        }
+    }
+
     private static func convertDecoModel(_ model: dc_decomodel_t) -> DiveData.DecoModel {
         let type: DiveData.DecoModel.DecoType
         

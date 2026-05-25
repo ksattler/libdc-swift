@@ -37,6 +37,7 @@ public struct SampleData {
     
     // Dive mode and model
     var diveMode: DiveData.DiveMode = .openCircuit
+    var sampleDiveMode: DiveData.DiveMode?  // Per-sample dive mode from DC_SAMPLE_DIVEMODE
     var decoModel: DiveData.DecoModel? // Decompression model
     
     // Location data

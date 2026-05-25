@@ -209,7 +209,13 @@ import LibDCBridge
     ) -> Bool {
         logDebug("Attempting to open BLE device: \(name) at address: \(deviceAddress)")
 
-        // Set connecting flag to prevent auto-reconnect during connection attempt
+        // Set connecting flag to prevent auto-reconnect during connection attempt.
+        // Also record the device UUID so the BLE bridge can resolve per-device
+        // authentication data (stored access codes) for ioctl requests issued
+        // synchronously from the libdivecomputer protocol thread.
+        if let manager = CoreBluetoothManager.shared() as? CoreBluetoothManager {
+            manager.connectingDeviceUUID = deviceAddress
+        }
         DispatchQueue.main.async {
             if let manager = CoreBluetoothManager.shared() as? CoreBluetoothManager {
                 manager.isConnecting = true
@@ -290,9 +296,8 @@ import LibDCBridge
                 manager.isConnecting = false
             }
         }
-        if let data = deviceData {
-            data.deallocate()
-        }
+        // open_ble_device_with_identification() already frees the device_data_t on failure
+        // via free() (it was allocated by C calloc()), so Swift must NOT call deallocate().
         return false
     }
     
