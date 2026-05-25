@@ -20,6 +20,14 @@
 - (void)setReadTimeout:(int)milliseconds;
 - (void)close;
 - (NSString *)getDeviceName;
+
+// Pelagic i330R/DSX authentication support
+- (NSString * _Nullable)consumePendingPincode;
+- (NSData * _Nullable)getStoredAccessCode;
+- (void)storeAccessCode:(NSData * _Nonnull)data;
+
+// Stream-buffer maintenance
+- (void)purgeReceivedData;
 @end
 
 #else
