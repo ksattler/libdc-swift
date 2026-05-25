@@ -1,6 +1,7 @@
 #import "BLEBridge.h"
 #import <Foundation/Foundation.h>
 #include <libdivecomputer/ble.h>
+#include <libdivecomputer/ioctl.h>
 
 static id<CoreBluetoothManagerProtocol> bleManager = nil;
 
@@ -129,8 +130,45 @@ dc_status_t ble_ioctl(ble_object_t *io, unsigned int request, void *data, size_t
     }
 
     case DC_IOCTL_BLE_GET_NAME:
-        // Not required by currently supported computers; implement if a backend needs it.
         return DC_STATUS_UNSUPPORTED;
+
+    case DC_IOCTL_BLE_GET_PINCODE: {
+        if (!data || size == 0) return DC_STATUS_INVALIDARGS;
+        NSString *pin = [manager consumePendingPincode];
+        if (pin == nil) {
+            NSLog(@"ble_ioctl: GET_PINCODE requested but no PIN pending");
+            return DC_STATUS_UNSUPPORTED;
+        }
+        const char *utf8 = [pin UTF8String];
+        size_t len = strlen(utf8);
+        if (len + 1 > size) return DC_STATUS_INVALIDARGS;
+        memcpy(data, utf8, len);
+        ((char *)data)[len] = '\0';
+        return DC_STATUS_SUCCESS;
+    }
+
+    case DC_IOCTL_BLE_GET_ACCESSCODE: {
+        if (!data || size == 0) return DC_STATUS_INVALIDARGS;
+        NSData *code = [manager getStoredAccessCode];
+        if (code == nil) {
+            // DC_STATUS_UNSUPPORTED = "no code stored"; caller falls back to PIN auth.
+            return DC_STATUS_UNSUPPORTED;
+        }
+        if (code.length != size) {
+            NSLog(@"ble_ioctl: stored access code size mismatch (%lu vs %zu)",
+                  (unsigned long)code.length, size);
+            return DC_STATUS_UNSUPPORTED;
+        }
+        memcpy(data, code.bytes, size);
+        return DC_STATUS_SUCCESS;
+    }
+
+    case DC_IOCTL_BLE_SET_ACCESSCODE: {
+        if (!data || size == 0) return DC_STATUS_INVALIDARGS;
+        NSData *code = [NSData dataWithBytes:data length:size];
+        [manager storeAccessCode:code];
+        return DC_STATUS_SUCCESS;
+    }
 
     default:
         return DC_STATUS_UNSUPPORTED;
@@ -175,6 +213,13 @@ dc_status_t ble_write(ble_object_t *io, const void *data, size_t size, size_t *a
         *actual = 0;
         return DC_STATUS_IO;
     }
+}
+
+dc_status_t ble_purge(ble_object_t *io) {
+    Class CoreBluetoothManagerClass = NSClassFromString(@"CoreBluetoothManager");
+    id<CoreBluetoothManagerProtocol> manager = [CoreBluetoothManagerClass shared];
+    [manager purgeReceivedData];
+    return DC_STATUS_SUCCESS;
 }
 
 dc_status_t ble_close(ble_object_t *io) {

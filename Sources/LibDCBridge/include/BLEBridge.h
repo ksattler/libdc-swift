@@ -54,6 +54,7 @@ dc_status_t ble_ioctl(ble_object_t *io, unsigned int request, void *data, size_t
 dc_status_t ble_sleep(ble_object_t *io, unsigned int milliseconds);
 dc_status_t ble_read(ble_object_t *io, void *data, size_t size, size_t *actual);
 dc_status_t ble_write(ble_object_t *io, const void *data, size_t size, size_t *actual);
+dc_status_t ble_purge(ble_object_t *io);
 dc_status_t ble_close(ble_object_t *io);
 
 // BLE setup functions
