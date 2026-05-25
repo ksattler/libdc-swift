@@ -893,10 +893,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 
 		// Depth (1/100 m).
 		unsigned int depth = array_uint16_le (data + offset);
-		// Guard: if the depth high-byte and next (length) byte are both 0xFD,
-		// we are reading the FD FD end-of-profile marker as sample data.
-		// Stop here to avoid emitting a garbage ~650 m depth sample.
-		if (data[offset + 1] == 0xFD && offset + 2 < size && data[offset + 2] == 0xFD) {
+		// Guard: 0xFD 0xFD is the end-of-profile marker; detect it before
+		// emitting a garbage ~650 m depth sample.
+		if (data[offset] == 0xFD && data[offset + 1] == 0xFD) {
 			truncated = 1;
 			goto truncated_profile;
 		}

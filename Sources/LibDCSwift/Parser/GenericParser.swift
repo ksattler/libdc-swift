@@ -373,13 +373,10 @@ public class GenericParser {
         }
 
         // The device header always stores accurate summary values (maxDepth, divetime,
-        // avgDepth) set by the firmware. Sample-derived values may be 0 (no samples)
-        // or lower than the true maximum (truncated profile). Prefer header values
-        // when available and when they indicate a deeper/longer dive than samples show.
+        // avgDepth) set by the firmware. Prefer header max depth unconditionally —
+        // profile-derived max can be corrupted by stray end-marker samples.
         if let headerMaxDepth: Double = getField(parser, type: DC_FIELD_MAXDEPTH), headerMaxDepth > 0 {
-            if wrapper.data.maxDepth == 0 || headerMaxDepth > wrapper.data.maxDepth {
-                wrapper.data.maxDepth = headerMaxDepth
-            }
+            wrapper.data.maxDepth = headerMaxDepth
         }
         if let headerDivetime: UInt32 = getField(parser, type: DC_FIELD_DIVETIME), headerDivetime > 0 {
             if wrapper.data.maxTime == 0 || TimeInterval(headerDivetime) > wrapper.data.maxTime {
