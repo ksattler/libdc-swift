@@ -275,7 +275,8 @@ public class GenericParser {
                 rbt: data.rbt,
                 heartbeat: data.heartbeat,
                 bearing: data.bearing,
-                setpoint: data.setpoint
+                setpoint: data.setpoint,
+                diveMode: data.sampleDiveMode
             )
         }
 
@@ -361,6 +362,20 @@ public class GenericParser {
         }
         
         let wrapper = SampleAccumulator()
+
+        // Dive mode from the header, so every profile point carries it (the
+        // app colours profile segments by mode).
+        if let modeValue: UInt32 = getField(parser, type: DC_FIELD_DIVEMODE) {
+            wrapper.data.sampleDiveMode = switch modeValue {
+            case DC_DIVEMODE_FREEDIVE.rawValue: .freedive
+            case DC_DIVEMODE_GAUGE.rawValue: .gauge
+            case DC_DIVEMODE_OC.rawValue: .openCircuit
+            case DC_DIVEMODE_CCR.rawValue: .closedCircuit
+            case DC_DIVEMODE_SCR.rawValue: .semiClosedCircuit
+            default: .openCircuit
+            }
+        }
+
         let wrapperPtr = UnsafeMutableRawPointer(Unmanaged.passRetained(wrapper).toOpaque())
 
         let sampleCallback: dc_sample_callback_t = { type, valuePtr, userData in
@@ -380,10 +395,12 @@ public class GenericParser {
             field: getField(parser, type: DC_FIELD_AVGDEPTH),
             maxDepth: wrapper.data.maxDepth,
             sampled: wrapper.calculateAverageDepth(upTo: divetime))
-        // Other families keep the sampled maximum; their field semantics aren't verified.
+        // Other families keep the sampled maximum, unless the header reports a
+        // deeper dive (no or truncated samples, e.g. corrupt OSTC profiles).
+        let headerMaxDepth: Double? = getField(parser, type: DC_FIELD_MAXDEPTH)
         let maxDepth = family == .suuntoNautic
-            ? resolveMaxDepth(field: getField(parser, type: DC_FIELD_MAXDEPTH), sampled: wrapper.data.maxDepth)
-            : wrapper.data.maxDepth
+            ? resolveMaxDepth(field: headerMaxDepth, sampled: wrapper.data.maxDepth)
+            : max(wrapper.data.maxDepth, headerMaxDepth.flatMap { $0.isFinite ? $0 : nil } ?? 0)
 
         // Get gas mix information
         if let gasmixCount: UInt32 = getField(parser, type: DC_FIELD_GASMIX_COUNT) {
@@ -416,20 +433,8 @@ public class GenericParser {
             wrapper.setDecoModel(decoModel)
         }
         
-        // Get dive mode
-        let diveMode: DiveData.DiveMode
-        if let modeValue: UInt32 = getField(parser, type: DC_FIELD_DIVEMODE) {
-            diveMode = switch modeValue {
-            case DC_DIVEMODE_FREEDIVE.rawValue: .freedive
-            case DC_DIVEMODE_GAUGE.rawValue: .gauge
-            case DC_DIVEMODE_OC.rawValue: .openCircuit
-            case DC_DIVEMODE_CCR.rawValue: .closedCircuit
-            case DC_DIVEMODE_SCR.rawValue: .semiClosedCircuit
-            default: .openCircuit
-            }
-        } else {
-            diveMode = .openCircuit  // Default to OC if not specified
-        }
+        // Dive mode was already fetched before sample processing
+        let diveMode = wrapper.data.diveMode
 
         // Get environmental data fields
         if let salinity: dc_salinity_t = getField(parser, type: DC_FIELD_SALINITY) {

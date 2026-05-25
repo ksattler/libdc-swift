@@ -71,6 +71,16 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     @objc private var timeout: Int = -1 // default to no timeout
     private var writeCharacteristic: CBCharacteristic?
     private var notifyCharacteristic: CBCharacteristic?
+    /// u-blox / HW SPS credits flow-control channel. For services that use a
+    /// credits-based BLE Serial-Port-Service (e.g. OSTC 4/5 via 2456e1b9-...
+    /// "u-connectXpress SPS", UBX-16011192) the device will not send any data
+    /// until the central writes an initial credit count to this characteristic.
+    private var creditsCharacteristic: CBCharacteristic?
+    private static let creditBatch: UInt8 = 0x40  // 64 packets per top-up
+    private static let creditLowWater: Int = 32   // refill once budget hits this
+    /// Credits still owed to us by the peer: how many more notifications the
+    /// device may send before it must wait for us to grant more.
+    private var peerCreditBudget: Int = 0
     // Queue of raw BLE notification payloads, one entry per didUpdateValueFor
     // call. shearwater_common_slip_read (libdivecomputer) strips a fixed
     // 2-byte header from every dc_iostream_read() call on the assumption
@@ -124,6 +134,71 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     /// - Returns: True if device data pointer exists
     public func hasValidDeviceDataPtr() -> Bool {
         return openedDeviceDataPtr != nil
+    }
+
+    // MARK: - Pelagic i330R/DSX Authentication
+    /// True while the libdivecomputer protocol thread is blocked waiting for
+    /// the user to enter a PIN. Observed by the UI to show a prompt.
+    @Published public var isWaitingForPincode = false
+
+    private var _pendingPincode: String?
+    private let authLock = NSLock()
+    private let pincodeSemaphore = DispatchSemaphore(value: 0)
+
+    /// UUID of the device the libdivecomputer C protocol is currently opening.
+    /// Set by `DeviceConfiguration.openBLEDevice` before the C open call so
+    /// the BLE bridge can look up the matching stored access code.
+    public var connectingDeviceUUID: String?
+
+    /// Called from the UI after the user enters a PIN. Wakes up the protocol
+    /// thread that is blocked inside `consumePendingPincode`.
+    public func submitPincode(_ pin: String) {
+        authLock.lock()
+        _pendingPincode = pin
+        authLock.unlock()
+        DispatchQueue.main.async { self.isWaitingForPincode = false }
+        pincodeSemaphore.signal()
+    }
+
+    /// Called from the UI if the user cancels the PIN prompt.
+    public func cancelPincode() {
+        authLock.lock()
+        _pendingPincode = nil
+        authLock.unlock()
+        DispatchQueue.main.async { self.isWaitingForPincode = false }
+        pincodeSemaphore.signal()
+    }
+
+    /// Called from the BLE bridge (background protocol thread) when the C
+    /// code issues `DC_IOCTL_BLE_GET_PINCODE`. Blocks until the user submits
+    /// a PIN via the UI. Returns nil if the user cancels or the wait times out.
+    @objc public func consumePendingPincode() -> String? {
+        // The protocol may invoke this in a retry loop with the same connection.
+        // Each call requires a fresh user interaction.
+        DispatchQueue.main.async { self.isWaitingForPincode = true }
+
+        // Wait up to 2 minutes for user input
+        let result = pincodeSemaphore.wait(timeout: .now() + 120)
+        if result == .timedOut {
+            DispatchQueue.main.async { self.isWaitingForPincode = false }
+            return nil
+        }
+
+        authLock.lock()
+        let pin = _pendingPincode
+        _pendingPincode = nil
+        authLock.unlock()
+        return pin
+    }
+
+    @objc public func getStoredAccessCode() -> Data? {
+        guard let uuid = connectingDeviceUUID else { return nil }
+        return AccessCodeStorage.shared.getAccessCode(uuid: uuid)
+    }
+
+    @objc public func storeAccessCode(_ data: Data) {
+        guard let uuid = connectingDeviceUUID else { return }
+        AccessCodeStorage.shared.setAccessCode(uuid: uuid, code: data)
     }
     
     // MARK: - Serial Services
@@ -243,6 +318,16 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
         }
 
         return notifyCharacteristic.isNotifying
+    }
+
+    /// Discards every buffered BLE notification. Used by `ble_purge` from the
+    /// libdivecomputer bridge after a corrupt-profile recovery to make sure
+    /// stale junk bytes from the previous response don't bleed into the next
+    /// command's echo read.
+    @objc public func purgeReceivedData() {
+        queue.sync {
+            receivedPackets.removeAll()
+        }
     }
     
     /// `canSendWriteWithoutResponse` (and the `peripheralIsReady(
@@ -403,6 +488,8 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             }
         }
 
+        let pktCount = queue.sync { receivedPackets.count }
+        logWarning("readDataPartial: timed out waiting for \(requestedInt) bytes; queue=\(pktCount) creditBudget=\(peerCreditBudget)")
         return nil
     }
     
@@ -427,6 +514,7 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             characteristicsByUUID.removeAll()
             ioctlReadValue = nil
             ioctlReadCharUUID = nil
+            receivedPackets.removeAll()
         }
 
         // Drain and signal semaphore to unblock any waiting reads and clear stale signals
@@ -437,19 +525,25 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
 
         var needsShutdownSettleDelay = false
         if clearDevicePtr {
-            if let devicePtr = self.openedDeviceDataPtr {
+            if let devicePtr = _deviceDataPtr {
                 if devicePtr.pointee.device != nil {
                     dc_device_close(devicePtr.pointee.device)
                     needsShutdownSettleDelay = true
                 }
                 devicePtr.deallocate()
-                self.openedDeviceDataPtr = nil
+                // Bypass the setter (which calls objectWillChange.send()) because
+                // we're on a background thread. Nil the ivar directly, then notify
+                // the UI on main so SwiftUI sees the change without a thread warning.
+                _deviceDataPtr = nil
+                DispatchQueue.main.async { self.objectWillChange.send() }
             }
         }
 
         if let peripheral = self.peripheral {
             self.writeCharacteristic = nil
             self.notifyCharacteristic = nil
+            self.creditsCharacteristic = nil
+            self.peerCreditBudget = 0
             self.peripheral = nil
             if needsShutdownSettleDelay {
                 // dc_device_close (above) sends a protocol-level shutdown command
@@ -639,6 +733,7 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             self.connectedDevice = nil
             self.writeCharacteristic = nil
             self.notifyCharacteristic = nil
+            self.creditsCharacteristic = nil
             self.peripheral = nil
         }
         centralManager.cancelPeripheralConnection(peripheral)
@@ -847,10 +942,32 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             return
         }
 
+        let isUBloxSPS = service.uuid.uuidString.lowercased().hasPrefix("2456e1b9")
+
         queue.sync {
             for characteristic in characteristics {
                 characteristicsByUUID[characteristic.uuid.uuidString.lowercased()] = characteristic
             }
+        }
+
+        // U-blox / HW SPS layout (OSTC 4/5): FIRST write+notify = data FIFO,
+        // SECOND write+notify = credits channel (must not carry protocol bytes).
+        if isUBloxSPS {
+            for characteristic in characteristics {
+                if writeCharacteristic == nil && !characteristic.properties.isDisjoint(with: [.write, .writeWithoutResponse]) {
+                    writeCharacteristic = characteristic
+                    if !characteristic.properties.isDisjoint(with: [.notify, .indicate]) {
+                        notifyCharacteristic = characteristic
+                        peripheral.setNotifyValue(true, for: characteristic)
+                    }
+                } else if creditsCharacteristic == nil && !characteristic.properties.isDisjoint(with: [.write, .writeWithoutResponse]) {
+                    creditsCharacteristic = characteristic
+                    if !characteristic.properties.isDisjoint(with: [.notify, .indicate]) {
+                        peripheral.setNotifyValue(true, for: characteristic)
+                    }
+                }
+            }
+            return
         }
 
         // Two-pass selection. Some dive computers (Aqualung i300C and other
@@ -887,13 +1004,47 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
 
     }
 
+    private func sendInitialCredits() {
+        peerCreditBudget = 0
+        grantCredits(CoreBluetoothManager.creditBatch)
+    }
+
+    private func grantCredits(_ amount: UInt8) {
+        guard let peripheral = self.peripheral,
+              let credits = creditsCharacteristic else { return }
+        let value = Data([amount])
+        let type: CBCharacteristicWriteType =
+            credits.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        peripheral.writeValue(value, for: credits, type: type)
+        peerCreditBudget += Int(amount)
+        logInfo("Granted \(amount) credits to peer (budget now \(peerCreditBudget))")
+    }
+
+    private func propertiesDescription(_ props: CBCharacteristicProperties) -> String {
+        var parts: [String] = []
+        if props.contains(.read) { parts.append("read") }
+        if props.contains(.write) { parts.append("write") }
+        if props.contains(.writeWithoutResponse) { parts.append("writeWithoutResponse") }
+        if props.contains(.notify) { parts.append("notify") }
+        if props.contains(.indicate) { parts.append("indicate") }
+        return parts.joined(separator: "|")
+    }
+
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             logError("Error receiving data: \(error.localizedDescription)")
             return
         }
-        
+
         guard let data = characteristic.value else {
+            return
+        }
+
+        // Credits-channel notifications carry flow-control bytes, not payload.
+        if characteristic === creditsCharacteristic {
+            if let first = data.first {
+                logInfo("Received \(Int8(bitPattern: first)) credits from peer")
+            }
             return
         }
 
@@ -901,8 +1052,8 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
 
         var handledAsIoctlRead = false
         queue.sync {
-            // Route the value of an explicitly requested characteristic read (e.g. the Cressi
-            // serial/model/firmware characteristics) to the ioctl slot instead of the SLIP stream.
+            // Route explicitly-requested characteristic reads (e.g. Cressi serial/model/firmware
+            // via DC_IOCTL_BLE_CHARACTERISTIC_READ) to the ioctl slot instead of the data stream.
             if let want = ioctlReadCharUUID,
                characteristic.uuid.uuidString.lowercased() == want {
                 ioctlReadValue = data
@@ -917,6 +1068,16 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
         if handledAsIoctlRead {
             return
         }
+
+        // u-blox SPS: each data notification consumes one credit. Refill before running out.
+        if creditsCharacteristic != nil {
+            peerCreditBudget -= 1
+            if peerCreditBudget <= CoreBluetoothManager.creditLowWater {
+                grantCredits(CoreBluetoothManager.creditBatch)
+            }
+        }
+
+        logDebug("BLE RX: \(data.count) bytes (budget=\(peerCreditBudget))")
 
         // Signal that data is available - wake up any waiting read
         dataAvailableSemaphore.signal()
@@ -979,6 +1140,13 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             logError("Error changing notification state: \(error.localizedDescription)")
+            return
+        }
+        // Once the credits characteristic is notifying we must grant the peer
+        // an initial credit pool; without this, the OSTC 4/5 won't send the
+        // protocol echo and downloads will time out.
+        if characteristic === creditsCharacteristic && characteristic.isNotifying {
+            sendInitialCredits()
         }
     }
 

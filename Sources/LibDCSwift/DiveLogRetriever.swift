@@ -18,6 +18,10 @@ public class DiveLogRetriever {
         var logCount: Int = 1
         let viewModel: DiveDataViewModel
         var lastFingerprint: Data?
+        /// Fingerprint of the most recently processed dive (the oldest of all dives downloaded
+        /// so far). Used to save a partial fingerprint on IO-abort so the next connection skips
+        /// already-downloaded dives and avoids re-requesting the failing slot.
+        var lastDownloadedFingerprint: Data?
         let deviceName: String
         let deviceUUID: String
         var deviceSerial: String?
@@ -516,17 +520,25 @@ public class DiveLogRetriever {
                                 deviceType = context.deviceTypeFromLibDC ?? context.deviceName
                             }
                             logInfo("✅ Download completed - \(context.logCount - 1) dive(s) downloaded")
-                            viewModel.saveFingerprint(lastFP, deviceType: deviceType, serial: serial)
-                            viewModel.finalizeDiveNumbering()  // Sort by date and renumber (oldest = #1)
-                            viewModel.updateProgress(.completed)
+                            DispatchQueue.main.async {
+                                viewModel.saveFingerprint(lastFP, deviceType: deviceType, serial: serial)
+                                viewModel.finalizeDiveNumbering()
+                                viewModel.updateProgress(.completed)
+                                completion(true)
+                            }
                         } else if context.fingerprintMatched || (context.storedFingerprint != nil && !context.hasNewDives) {
                             logInfo("ℹ️ No new dives found")
-                            viewModel.updateProgress(.noNewDives)
+                            DispatchQueue.main.async {
+                                viewModel.updateProgress(.noNewDives)
+                                completion(true)
+                            }
                         } else {
-                            viewModel.finalizeDiveNumbering()  // Sort by date and renumber (oldest = #1)
-                            viewModel.updateProgress(.completed)
+                            DispatchQueue.main.async {
+                                viewModel.finalizeDiveNumbering()
+                                viewModel.updateProgress(.completed)
+                                completion(true)
+                            }
                         }
-                        completion(true)
                     }
                     
                     context.isCompleted = true
