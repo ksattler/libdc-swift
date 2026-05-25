@@ -56,7 +56,8 @@ import LibDCBridge
         
         // Heinrichs Weikamp computers
         ComputerModel(name: "Heinrichs Weikamp OSTC 3", family: .hwOstc3, modelID: 0x0A),
-        ComputerModel(name: "Heinrichs Weikamp OSTC 4", family: .hwOstc3, modelID: 0x3B),
+        ComputerModel(name: "Heinrichs Weikamp OSTC 4", family: .hwOstc3, modelID: 0x43),
+        ComputerModel(name: "Heinrichs Weikamp OSTC 5", family: .hwOstc3, modelID: 0x44),
         ComputerModel(name: "Heinrichs Weikamp OSTC Plus", family: .hwOstc3, modelID: 0x13),
         ComputerModel(name: "Heinrichs Weikamp OSTC 2", family: .hwOstc3, modelID: 0x11),
         ComputerModel(name: "Heinrichs Weikamp OSTC Sport", family: .hwOstc3, modelID: 0x12),
@@ -372,8 +373,15 @@ import LibDCBridge
             return
         }
         
-        let actualModel = deviceDataPtr.pointee.devinfo.model
-        
+        // Use descriptor model (e.g. 0x43/0x44 for OSTC4/5), not devinfo.model
+        // which is the hardware protocol byte (0x3B) — different number space.
+        let actualModel: UInt32
+        if let desc = deviceDataPtr.pointee.descriptor {
+            actualModel = dc_descriptor_get_model(desc)
+        } else {
+            actualModel = deviceDataPtr.pointee.devinfo.model
+        }
+
         if let storedDevice = DeviceStorage.shared.getStoredDevice(uuid: deviceAddress) {
             if storedDevice.model != actualModel {
                 logInfo("🔄 Updating stored device model from \(storedDevice.model) to actual model \(actualModel) for \(deviceName)")

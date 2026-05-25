@@ -64,15 +64,19 @@ public class DiveLogRetriever {
            let devicePtr = context.devicePtr,
            devicePtr.pointee.have_devinfo != 0 {
             context.deviceSerial = String(format: "%08x", devicePtr.pointee.devinfo.serial)
-            context.detectedModel = devicePtr.pointee.devinfo.model
-            
+
             // Capture the exact device type string from libdivecomputer
             if let modelCStr = devicePtr.pointee.model {
                 context.deviceTypeFromLibDC = String(cString: modelCStr)
             }
-            
+
             if let desc = devicePtr.pointee.descriptor {
                 context.detectedFamily = dc_descriptor_get_type(desc)
+                // Use descriptor model (e.g. 0x43/0x44 for OSTC4/5), not devinfo.model
+                // which is the hardware protocol byte (0x3B) — different number space.
+                context.detectedModel = dc_descriptor_get_model(desc)
+            } else {
+                context.detectedModel = devicePtr.pointee.devinfo.model
             }
 
             // Update stored device with serial for fingerprint cleanup when forgetting
