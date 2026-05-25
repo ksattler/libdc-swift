@@ -395,12 +395,18 @@ public class GenericParser {
             field: getField(parser, type: DC_FIELD_AVGDEPTH),
             maxDepth: wrapper.data.maxDepth,
             sampled: wrapper.calculateAverageDepth(upTo: divetime))
-        // Other families keep the sampled maximum, unless the header reports a
-        // deeper dive (no or truncated samples, e.g. corrupt OSTC profiles).
+        // Other families prefer the header maximum set by the firmware: the
+        // sampled maximum can be missing (truncated profile) or corrupted by
+        // stray end-marker samples (OSTC 4/5).
         let headerMaxDepth: Double? = getField(parser, type: DC_FIELD_MAXDEPTH)
-        let maxDepth = family == .suuntoNautic
-            ? resolveMaxDepth(field: headerMaxDepth, sampled: wrapper.data.maxDepth)
-            : max(wrapper.data.maxDepth, headerMaxDepth.flatMap { $0.isFinite ? $0 : nil } ?? 0)
+        let maxDepth: Double
+        if family == .suuntoNautic {
+            maxDepth = resolveMaxDepth(field: headerMaxDepth, sampled: wrapper.data.maxDepth)
+        } else if let headerMaxDepth, headerMaxDepth > 0, headerMaxDepth.isFinite {
+            maxDepth = headerMaxDepth
+        } else {
+            maxDepth = wrapper.data.maxDepth
+        }
 
         // Get gas mix information
         if let gasmixCount: UInt32 = getField(parser, type: DC_FIELD_GASMIX_COUNT) {
