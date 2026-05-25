@@ -1,5 +1,6 @@
 #include "configuredc.h"
 #include "BLEBridge.h"
+#include <libdivecomputer/context.h>
 #include <libdivecomputer/device.h>
 #include <libdivecomputer/descriptor.h>
 #include <libdivecomputer/iostream.h>
@@ -8,6 +9,32 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+/*--------------------------------------------------------------------
+ * libdivecomputer log forwarding to stderr so internal ERROR/WARNING
+ * messages from device protocols (e.g. pelagic_i330r) are visible.
+ *------------------------------------------------------------------*/
+static const char *libdc_loglevel_name(dc_loglevel_t lvl) {
+    switch (lvl) {
+        case DC_LOGLEVEL_ERROR:   return "ERROR";
+        case DC_LOGLEVEL_WARNING: return "WARN ";
+        case DC_LOGLEVEL_INFO:    return "INFO ";
+        case DC_LOGLEVEL_DEBUG:   return "DEBUG";
+        default:                  return "TRACE";
+    }
+}
+
+static void libdc_logfunc(dc_context_t *context, dc_loglevel_t lvl,
+                          const char *file, unsigned int line,
+                          const char *function, const char *message,
+                          void *userdata) {
+    (void)context; (void)userdata;
+    printf("[libdc %s] %s: %s\n",
+           libdc_loglevel_name(lvl),
+           function ? function : "?",
+           message ? message : "");
+    fflush(stdout);
+}
 
 /*--------------------------------------------------------------------
  * BLE stream structures
@@ -26,6 +53,7 @@ static dc_status_t ble_stream_write         (dc_iostream_t *iostream, const void
 static dc_status_t ble_stream_ioctl         (dc_iostream_t *iostream, unsigned int request, void *data_, size_t size_);
 static dc_status_t ble_stream_sleep         (dc_iostream_t *iostream, unsigned int milliseconds);
 static dc_status_t ble_stream_close         (dc_iostream_t *iostream);
+static dc_status_t ble_stream_purge         (dc_iostream_t *iostream, dc_direction_t direction);
 
 /*--------------------------------------------------------------------
  * Build custom vtable
@@ -44,10 +72,19 @@ static const dc_iostream_vtable_t ble_iostream_vtable = {
     .write         = ble_stream_write,
     .ioctl         = ble_stream_ioctl,
     .flush         = NULL,
-    .purge         = NULL,
+    .purge         = ble_stream_purge,
     .sleep         = ble_stream_sleep,
     .close         = ble_stream_close,
 };
+
+static dc_status_t ble_stream_purge(dc_iostream_t *iostream, dc_direction_t direction)
+{
+    if (direction & DC_DIRECTION_INPUT) {
+        ble_stream_t *s = (ble_stream_t *) iostream;
+        ble_purge(s->ble_object);
+    }
+    return DC_STATUS_SUCCESS;
+}
 
 /*--------------------------------------------------------------------
  * Helper to print hex dumps for debugging
@@ -175,9 +212,10 @@ static dc_status_t ble_stream_close(dc_iostream_t *iostream)
     ble_stream_t *s = (ble_stream_t *) iostream;
     dc_status_t rc = ble_close(s->ble_object);
     freeBLEObject(s->ble_object);
-    // Do NOT free(s) here — dc_iostream_close calls dc_iostream_deallocate
+    s->ble_object = NULL;
+    // Do NOT free(s) here — dc_iostream_close() calls dc_iostream_deallocate()
     // after this vtable close returns, which frees the iostream memory.
-    // Freeing here causes a double-free crash (POINTER_BEING_FREED_WAS_NOT_ALLOCATED).
+    // Freeing here causes a double-free crash.
     return rc;
 }
 
@@ -325,6 +363,11 @@ dc_status_t open_ble_device(device_data_t *data, const char *devaddr, dc_family_
         return rc;
     }
 
+    // Surface libdivecomputer's internal ERROR/WARNING/INFO logs.
+    // INFO is verbose but invaluable while debugging device protocols.
+    dc_context_set_loglevel(data->context, DC_LOGLEVEL_INFO);
+    dc_context_set_logfunc(data->context, libdc_logfunc, NULL);
+
     // Get descriptor for the device
     rc = find_descriptor_by_model(&descriptor, family, model);
     if (rc != DC_STATUS_SUCCESS) {
@@ -443,9 +486,10 @@ struct name_pattern {
     const char *vendor;
     const char *product;
     enum {
-        MATCH_EXACT,    // Full string match
-        MATCH_PREFIX,   // Prefix match only
-        MATCH_CONTAINS  // Substring match
+        MATCH_EXACT,           // Substring match anywhere in name
+        MATCH_PREFIX,          // Prefix match only
+        MATCH_CONTAINS,        // Substring match
+        MATCH_PREFIX_NUMBERS   // Prefix followed by digits only (e.g. "GD314554")
     } match_type;
 };
 
@@ -494,11 +538,13 @@ static const struct name_pattern name_patterns[] = {
     { "Neon", "Cressi", "Neon", MATCH_CONTAINS },
     { "Nepto", "Cressi", "Nepto", MATCH_CONTAINS },
     
-    // Heinrichs Weikamp dive computers
+    // Heinrichs Weikamp dive computers (order matters: most specific first)
+    { "OSTC5", "Heinrichs Weikamp", "OSTC 5", MATCH_EXACT },
+    { "OSTC 5", "Heinrichs Weikamp", "OSTC 5", MATCH_EXACT },
+    { "OSTC 4-", "Heinrichs Weikamp", "OSTC 4", MATCH_EXACT },
     { "OSTC 3", "Heinrichs Weikamp", "OSTC Plus", MATCH_EXACT },
     { "OSTC s#", "Heinrichs Weikamp", "OSTC Sport", MATCH_EXACT },
     { "OSTC s ", "Heinrichs Weikamp", "OSTC Sport", MATCH_EXACT },
-    { "OSTC 4-", "Heinrichs Weikamp", "OSTC 4", MATCH_EXACT },
     { "OSTC 2-", "Heinrichs Weikamp", "OSTC 2N", MATCH_EXACT },
     { "OSTC + ", "Heinrichs Weikamp", "OSTC 2", MATCH_EXACT },
     { "OSTC", "Heinrichs Weikamp", "OSTC 2", MATCH_EXACT },
@@ -518,7 +564,12 @@ static const struct name_pattern name_patterns[] = {
     // Ratio dive computers
     { "DS", "Ratio", "iX3M 2021 GPS Easy", MATCH_EXACT },
     { "IX5M", "Ratio", "iX3M 2021 GPS Easy", MATCH_EXACT },
-    { "RATIO-", "Ratio", "iX3M 2021 GPS Easy", MATCH_EXACT }
+    { "RATIO-", "Ratio", "iX3M 2021 GPS Easy", MATCH_EXACT },
+
+    // Pelagic dive computers (advertise as 2-char model code + serial digits)
+    { "GA", "Apeks",    "DSX",            MATCH_PREFIX_NUMBERS }, // 0x4741
+    { "GD", "Aqualung", "i330R",          MATCH_PREFIX_NUMBERS }, // 0x4744
+    { "GM", "Aqualung", "i330R Console",  MATCH_PREFIX_NUMBERS }  // 0x474D
 };
 
 dc_status_t find_descriptor_by_name(dc_descriptor_t **out_descriptor, const char *name) {
@@ -541,6 +592,19 @@ dc_status_t find_descriptor_by_name(dc_descriptor_t **out_descriptor, const char
             case MATCH_CONTAINS:
                 matches = (strstr(name, name_patterns[i].prefix) != NULL);
                 break;
+            case MATCH_PREFIX_NUMBERS: {
+                size_t plen = strlen(name_patterns[i].prefix);
+                if (strncmp(name, name_patterns[i].prefix, plen) == 0) {
+                    // Remaining characters must all be digits and at least one must follow
+                    matches = (name[plen] != '\0');
+                    for (size_t j = plen; matches && name[j] != '\0'; j++) {
+                        if (name[j] < '0' || name[j] > '9') {
+                            matches = false;
+                        }
+                    }
+                }
+                break;
+            }
         }
 
         if (matches) {
