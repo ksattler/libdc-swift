@@ -1,3 +1,4 @@
 [submodule "libdivecomputer"]
 	path = libdivecomputer
-	url = https://github.com/deepsealabs/libdivecomputer.git
+	url = https://github.com/ksattler/libdivecomputer.git
+	branch = scubabook
