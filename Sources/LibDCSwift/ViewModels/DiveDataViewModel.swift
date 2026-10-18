@@ -175,7 +175,7 @@ public class DiveDataViewModel: ObservableObject {
         case notStarted
         case inProgress(_ count: Int)
         case completed
-        case cancelled
+        case cancelled(_ count: Int)
         case failed(_ message: String)
         case noNewDives
         /// Every dive this session parsed to an empty record (no samples, no
@@ -190,26 +190,26 @@ public class DiveDataViewModel: ObservableObject {
             case .notStarted: return "Not started"
             case .inProgress(let count): return "Downloaded \(count) dives..."
             case .completed: return "Download completed"
-            case .cancelled: return "Download cancelled"
+            case .cancelled(let count): return "Download cancelled after \(count) dive(s)"
             case .failed(let error): return "Error: \(error)"
             case .noNewDives: return "No new dives found"
             case .emptyRead: return "Download returned no dive data"
             }
         }
-        
+
         public static func == (lhs: DownloadProgress, rhs: DownloadProgress) -> Bool {
             switch (lhs, rhs) {
             case (.notStarted, .notStarted):
                 return true
             case (.completed, .completed):
                 return true
-            case (.cancelled, .cancelled):
-                return true
             case (.noNewDives, .noNewDives):
                 return true
             case (.emptyRead, .emptyRead):
                 return true
             case let (.inProgress(count1), .inProgress(count2)):
+                return count1 == count2
+            case let (.cancelled(count1), .cancelled(count2)):
                 return count1 == count2
             case let (.failed(message1), .failed(message2)):
                 return message1 == message2

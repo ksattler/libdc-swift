@@ -515,6 +515,10 @@ public class DiveLogRetriever {
                     // so the regular "new dives" download keeps working afterwards.
                     let shouldSaveFingerprint = outcome.saveFingerprint && !context.isSelectiveDownload
                     let emptyReadOnly = outcome.emptyReadOnly
+                    // Read before resetting: set by cancelRetrieval(), which also made
+                    // pending BLE reads fail fast so foreach unwound early.
+                    let wasCancelled = bluetoothManager.cancelRequested
+                    bluetoothManager.cancelRequested = false
                     markRetrievalFinished(bluetoothManager)
 
                     // Record a stable status key for analytics before routing.
@@ -528,7 +532,11 @@ public class DiveLogRetriever {
 
                     // Handle the outcome
                     if !downloadSucceeded {
-                        if emptyReadOnly {
+                        if wasCancelled {
+                            let savedCount = context.logCount - 1 - context.emptyReadCount
+                            logInfo("🛑 Download cancelled by user after \(savedCount) dive(s)")
+                            viewModel.updateProgress(.cancelled(savedCount))
+                        } else if emptyReadOnly {
                             logWarning("⚠️ Download returned only empty reads (\(context.emptyReadCount)) — likely BLE contention (official app holding the link)")
                             viewModel.updateProgress(.emptyRead)
                         } else if outcome.interrupted {

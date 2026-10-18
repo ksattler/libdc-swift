@@ -62,6 +62,12 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
             objectWillChange.send()
         }
     }
+    // Set by cancelRetrieval() when the user aborts an in-progress download. Checked by
+    // readDataPartial() on every poll so a pending BLE read fails fast (DC_STATUS_IO)
+    // instead of waiting out its full read timeout — otherwise cancelling mid-way through
+    // a large dive (e.g. a long Shearwater Petrel technical dive) could take as long as
+    // the read timeout to actually stop.
+    @Published public var cancelRequested = false
     @Published public var isDisconnecting = false // Indicates if currently disconnecting from device
     @Published public var isBluetoothReady = false // Indicates if Bluetooth is ready for use
     @Published public var isConnecting = false // Indicates if a connection attempt is in progress (prevents auto-reconnect)
@@ -456,6 +462,11 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
         let timeout: TimeInterval = self.timeout > 0 ? Double(self.timeout) / 1000.0 : 3.0
 
         while Date().timeIntervalSince(startTime) < timeout {
+            if cancelRequested {
+                logInfo("🛑 readDataPartial aborted early - cancellation requested")
+                return nil
+            }
+
             var outData: Data?
 
             queue.sync {
@@ -715,6 +726,19 @@ public class CoreBluetoothManager: NSObject, CoreBluetoothManagerProtocol, Obser
     // MARK: - State Management
     public func clearRetrievalState() {
         DispatchQueue.main.async { [weak self] in
+            self?.isRetrievingLogs = false
+            self?.currentRetrievalDevice = nil
+            self?.cancelRequested = false
+        }
+    }
+
+    /// Aborts an in-progress dive log download. Sets `cancelRequested` so the next
+    /// `readDataPartial` poll (≤50ms away) fails fast instead of waiting out its read
+    /// timeout, which lets `dc_device_foreach` unwind almost immediately regardless of
+    /// how large the dive currently being transferred is.
+    public func cancelRetrieval() {
+        DispatchQueue.main.async { [weak self] in
+            self?.cancelRequested = true
             self?.isRetrievingLogs = false
             self?.currentRetrievalDevice = nil
         }
