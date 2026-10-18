@@ -332,7 +332,8 @@ public class DiveLogRetriever {
                     // Determine the outcome of the download
                     let downloadSucceeded: Bool
                     let shouldSaveFingerprint: Bool
-                    
+                    let wasCancelled = bluetoothManager.cancelRequested
+
                     switch enumStatus {
                     case DC_STATUS_SUCCESS:
                         // Normal successful completion
@@ -389,10 +390,15 @@ public class DiveLogRetriever {
                     if !downloadSucceeded {
                         DispatchQueue.main.async {
                             let savedCount = context.logCount - 1
-                            let msg = savedCount > 0
-                                ? "Download unterbrochen nach \(savedCount) Tauchgang/Tauchgängen. Erneut verbinden um weitere zu laden."
-                                : "Download fehlgeschlagen - DC_STATUS Fehlercode: \(enumStatus)"
-                            viewModel.setDetailedError(msg, status: enumStatus)
+                            if wasCancelled {
+                                logInfo("🛑 Download cancelled by user after \(savedCount) dive(s)")
+                                viewModel.updateProgress(.cancelled(savedCount))
+                            } else {
+                                let msg = savedCount > 0
+                                    ? "Download unterbrochen nach \(savedCount) Tauchgang/Tauchgängen. Erneut verbinden um weitere zu laden."
+                                    : "Download fehlgeschlagen - DC_STATUS Fehlercode: \(enumStatus)"
+                                viewModel.setDetailedError(msg, status: enumStatus)
+                            }
                             completion(false)
                         }
                     } else {
