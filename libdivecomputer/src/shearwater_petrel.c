@@ -39,9 +39,17 @@
 #define RECORD_SIZE   0x20
 #define RECORD_COUNT  (MANIFEST_SIZE / RECORD_SIZE)
 
+#define FINGERPRINT_SIZE 4
+
 typedef struct shearwater_petrel_device_t {
 	shearwater_common_device_t base;
-	unsigned char fingerprint[4];
+	unsigned char fingerprint[FINGERPRINT_SIZE];
+	// Optional dive selection (libdc-swift): concatenated fingerprints of the
+	// dives the next foreach should download. NULL downloads all new dives.
+	unsigned char *selection;
+	unsigned int nselection;
+	// All dive records of the manifest, read by shearwater_petrel_device_list.
+	dc_buffer_t *manifest_cache;
 } shearwater_petrel_device_t;
 
 static dc_status_t shearwater_petrel_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -95,6 +103,9 @@ shearwater_petrel_device_open (dc_device_t **out, dc_context_t *context, dc_iost
 
 	// Set the default values.
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
+	device->selection = NULL;
+	device->nselection = 0;
+	device->manifest_cache = NULL;
 
 	// Setup the device.
 	status = shearwater_common_setup (&device->base, context, iostream);
@@ -118,6 +129,13 @@ shearwater_petrel_device_close (dc_device_t *abstract)
 	dc_status_t status = DC_STATUS_SUCCESS;
 	shearwater_common_device_t *device = (shearwater_common_device_t *) abstract;
 	dc_status_t rc = DC_STATUS_SUCCESS;
+
+	shearwater_petrel_device_t *petrel = (shearwater_petrel_device_t *) abstract;
+	free (petrel->selection);
+	petrel->selection = NULL;
+	petrel->nselection = 0;
+	dc_buffer_free (petrel->manifest_cache);
+	petrel->manifest_cache = NULL;
 
 	// Shutdown the device.
 	unsigned char request[] = {0x2E, 0x90, 0x20, 0x00};
@@ -144,6 +162,235 @@ shearwater_petrel_device_set_fingerprint (dc_device_t *abstract, const unsigned 
 		memset (device->fingerprint, 0, sizeof (device->fingerprint));
 
 	return DC_STATUS_SUCCESS;
+}
+
+
+dc_status_t
+shearwater_petrel_device_set_selection (dc_device_t *abstract, const unsigned char data[], unsigned int count)
+{
+	shearwater_petrel_device_t *device = (shearwater_petrel_device_t *) abstract;
+
+	if (!ISINSTANCE (abstract))
+		return DC_STATUS_INVALIDARGS;
+
+	if (count && data == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	free (device->selection);
+	device->selection = NULL;
+	device->nselection = 0;
+
+	if (count == 0)
+		return DC_STATUS_SUCCESS;
+
+	device->selection = (unsigned char *) malloc (count * FINGERPRINT_SIZE);
+	if (device->selection == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	memcpy (device->selection, data, count * FINGERPRINT_SIZE);
+	device->nselection = count;
+
+	return DC_STATUS_SUCCESS;
+}
+
+
+static int
+shearwater_petrel_is_selected (shearwater_petrel_device_t *device, const unsigned char fingerprint[])
+{
+	if (device->selection == NULL)
+		return 1;
+
+	for (unsigned int i = 0; i < device->nselection; ++i) {
+		if (memcmp (device->selection + i * FINGERPRINT_SIZE, fingerprint, FINGERPRINT_SIZE) == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+
+/*
+ * Appends the records of the dives to download from the given records (valid
+ * dives only, newest first) to the manifests buffer. Stops at the fingerprint
+ * and applies the selection, unless list_all is set.
+ */
+static dc_status_t
+shearwater_petrel_filter_manifests (shearwater_petrel_device_t *device, const unsigned char *data, unsigned int size, dc_buffer_t *manifests, int list_all)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+
+	// The fingerprint marks the newest dive of the previous download. When
+	// downloading a selection, older dives are wanted too, so it is ignored.
+	int use_fingerprint = !list_all && device->selection == NULL;
+
+	for (unsigned int offset = 0; offset < size; offset += RECORD_SIZE) {
+		const unsigned char *fp = data + offset + 4;
+
+		if (use_fingerprint && memcmp (fp, device->fingerprint, sizeof (device->fingerprint)) == 0)
+			break;
+
+		if (!list_all && !shearwater_petrel_is_selected (device, fp))
+			continue;
+
+		if (!dc_buffer_append (manifests, data + offset, RECORD_SIZE)) {
+			ERROR (abstract->context, "Insufficient buffer space available.");
+			return DC_STATUS_NOMEMORY;
+		}
+	}
+
+	return DC_STATUS_SUCCESS;
+}
+
+
+/*
+ * Collects the records of the dives to download (newest first, deleted dives
+ * removed) in the manifests buffer. With list_all set, the fingerprint and the
+ * selection are ignored.
+ *
+ * The device returns the next manifest page on every read of MANIFEST_ADDR,
+ * so the manifest can be read only once per connection. A complete read (by
+ * shearwater_petrel_device_list) is therefore cached and reused by foreach.
+ */
+static dc_status_t
+shearwater_petrel_read_manifests (shearwater_petrel_device_t *device, dc_buffer_t *manifests, int list_all, unsigned int *current, unsigned int *maximum, dc_event_progress_t *progress)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t rc = DC_STATUS_SUCCESS;
+
+	if (device->manifest_cache) {
+		rc = shearwater_petrel_filter_manifests (device,
+			dc_buffer_get_data (device->manifest_cache), (unsigned int) dc_buffer_get_size (device->manifest_cache),
+			manifests, list_all);
+		*maximum += (unsigned int) (dc_buffer_get_size (manifests) / RECORD_SIZE);
+		return rc;
+	}
+
+	// Without a selection, reading can stop at the fingerprint.
+	int stop_at_fingerprint = !list_all && device->selection == NULL;
+
+	dc_buffer_t *buffer = dc_buffer_new (MANIFEST_SIZE);
+	dc_buffer_t *records = dc_buffer_new (MANIFEST_SIZE);
+	if (buffer == NULL || records == NULL) {
+		ERROR (abstract->context, "Insufficient buffer space available.");
+		dc_buffer_free (buffer);
+		dc_buffer_free (records);
+		return DC_STATUS_NOMEMORY;
+	}
+
+	while (1) {
+		// Update the progress state.
+		// Assume the worst case scenario of a full manifest, and adjust the
+		// value with the actual number of dives after the manifest has been
+		// processed.
+		*maximum += 1 + RECORD_COUNT;
+
+		// Download a manifest.
+		progress->current = NSTEPS * *current;
+		progress->maximum = NSTEPS * *maximum;
+		rc = shearwater_common_download (&device->base, buffer, MANIFEST_ADDR, MANIFEST_SIZE, 0, progress);
+		if (rc != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to download the manifest.");
+			break;
+		}
+
+		HEXDUMP(abstract->context, DC_LOGLEVEL_DEBUG, "Manifest", dc_buffer_get_data (buffer), dc_buffer_get_size (buffer));
+
+		// Cache the buffer pointer and size.
+		unsigned char *data = dc_buffer_get_data (buffer);
+		unsigned int size = (unsigned int) dc_buffer_get_size (buffer);
+
+		// Process the records in the manifest.
+		unsigned int count = 0, deleted = 0;
+		unsigned int offset = 0;
+		while (offset < size) {
+			// Check for a valid dive header.
+			unsigned int header = array_uint16_be (data + offset);
+			if (header == 0x5A23) {
+				// this is a deleted dive; keep looking
+				offset += RECORD_SIZE;
+				deleted++;
+				continue;
+			}
+			if (header != 0xA5C4)
+				break;
+
+			// Check the fingerprint data.
+			if (stop_at_fingerprint && memcmp (data + offset + 4, device->fingerprint, sizeof (device->fingerprint)) == 0)
+				break;
+
+			if (!dc_buffer_append (records, data + offset, RECORD_SIZE)) {
+				ERROR (abstract->context, "Insufficient buffer space available.");
+				rc = DC_STATUS_NOMEMORY;
+				break;
+			}
+
+			offset += RECORD_SIZE;
+			count++;
+		}
+
+		if (rc != DC_STATUS_SUCCESS)
+			break;
+
+		// Update the progress state.
+		*current += 1;
+		*maximum -= RECORD_COUNT - count;
+
+		// Stop downloading manifest if there are no more records.
+		if (count + deleted != RECORD_COUNT)
+			break;
+	}
+
+	dc_buffer_free (buffer);
+
+	if (rc == DC_STATUS_SUCCESS) {
+		unsigned int total = (unsigned int) (dc_buffer_get_size (records) / RECORD_SIZE);
+		rc = shearwater_petrel_filter_manifests (device, dc_buffer_get_data (records), total * RECORD_SIZE, manifests, list_all);
+		*maximum -= total - (unsigned int) (dc_buffer_get_size (manifests) / RECORD_SIZE);
+	}
+
+	// Only a complete read can serve later requests.
+	if (rc == DC_STATUS_SUCCESS && list_all) {
+		device->manifest_cache = records;
+	} else {
+		dc_buffer_free (records);
+	}
+
+	return rc;
+}
+
+
+dc_status_t
+shearwater_petrel_device_list (dc_device_t *abstract, shearwater_petrel_manifest_callback_t callback, void *userdata)
+{
+	shearwater_petrel_device_t *device = (shearwater_petrel_device_t *) abstract;
+
+	if (!ISINSTANCE (abstract))
+		return DC_STATUS_INVALIDARGS;
+
+	// Enable progress notifications.
+	unsigned int current = 0, maximum = 0;
+	dc_event_progress_t progress = EVENT_PROGRESS_INITIALIZER;
+	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+
+	dc_buffer_t *manifests = dc_buffer_new (MANIFEST_SIZE);
+	if (manifests == NULL) {
+		ERROR (abstract->context, "Insufficient buffer space available.");
+		return DC_STATUS_NOMEMORY;
+	}
+
+	dc_status_t rc = shearwater_petrel_read_manifests (device, manifests, 1, &current, &maximum, &progress);
+	if (rc == DC_STATUS_SUCCESS && callback) {
+		unsigned char *data = dc_buffer_get_data (manifests);
+		unsigned int size = (unsigned int) dc_buffer_get_size (manifests);
+		for (unsigned int offset = 0; offset < size; offset += RECORD_SIZE) {
+			if (!callback (data + offset + 4, FINGERPRINT_SIZE, userdata))
+				break;
+		}
+	}
+
+	dc_buffer_free (manifests);
+
+	return rc;
 }
 
 
@@ -241,69 +488,14 @@ shearwater_petrel_device_foreach (dc_device_t *abstract, dc_dive_callback_t call
 	}
 
 	// Read the manifest pages
-	while (1) {
-		// Update the progress state.
-		// Assume the worst case scenario of a full manifest, and adjust the
-		// value with the actual number of dives after the manifest has been
-		// processed.
-		maximum += 1 + RECORD_COUNT;
-
-		// Download a manifest.
-		progress.current = NSTEPS * current;
-		progress.maximum = NSTEPS * maximum;
-		rc = shearwater_common_download (&device->base, buffer, MANIFEST_ADDR, MANIFEST_SIZE, 0, &progress);
-		if (rc != DC_STATUS_SUCCESS) {
-			ERROR (abstract->context, "Failed to download the manifest.");
-			dc_buffer_free (buffer);
-			dc_buffer_free (manifests);
-			return rc;
-		}
-
-		HEXDUMP(abstract->context, DC_LOGLEVEL_DEBUG, "Manifest", dc_buffer_get_data (buffer), dc_buffer_get_size (buffer));
-
-		// Cache the buffer pointer and size.
-		unsigned char *data = dc_buffer_get_data (buffer);
-		unsigned int size = dc_buffer_get_size (buffer);
-
-		// Process the records in the manifest.
-		unsigned int count = 0, deleted = 0;
-		unsigned int offset = 0;
-		while (offset < size) {
-			// Check for a valid dive header.
-			unsigned int header = array_uint16_be (data + offset);
-			if (header == 0x5A23) {
-				// this is a deleted dive; keep looking
-				offset += RECORD_SIZE;
-				deleted++;
-				continue;
-			}
-			if (header != 0xA5C4)
-				break;
-
-			// Check the fingerprint data.
-			if (memcmp (data + offset + 4, device->fingerprint, sizeof (device->fingerprint)) == 0)
-				break;
-
-			offset += RECORD_SIZE;
-			count++;
-		}
-
-		// Update the progress state.
-		current += 1;
-		maximum -= RECORD_COUNT - count - deleted;
-
-		// Append the manifest records to the main buffer.
-		if (!dc_buffer_append (manifests, data, count * RECORD_SIZE)) {
-			ERROR (abstract->context, "Insufficient buffer space available.");
-			dc_buffer_free (buffer);
-			dc_buffer_free (manifests);
-			return DC_STATUS_NOMEMORY;
-		}
-
-		// Stop downloading manifest if there are no more records.
-		if (count + deleted != RECORD_COUNT)
-			break;
+	rc = shearwater_petrel_read_manifests (device, manifests, 0, &current, &maximum, &progress);
+	if (rc != DC_STATUS_SUCCESS) {
+		dc_buffer_free (buffer);
+		dc_buffer_free (manifests);
+		return rc;
 	}
+
+	INFO (abstract->context, "Dives to download: %u (selection: %u)", (unsigned int) (dc_buffer_get_size (manifests) / RECORD_SIZE), device->nselection);
 
 	// Update and emit a progress event.
 	progress.current = NSTEPS * current;

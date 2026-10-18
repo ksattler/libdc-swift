@@ -739,3 +739,23 @@ dc_status_t open_ble_device_with_identification(device_data_t **out_data,
     *out_data = data;
     return DC_STATUS_SUCCESS;
 }
+
+/*--------------------------------------------------------------------
+ * Dive selection
+ *------------------------------------------------------------------*/
+#include "shearwater_petrel.h"
+
+bool device_supports_dive_selection(device_data_t *data) {
+    if (!data || !data->device) return false;
+    return dc_device_get_type(data->device) == DC_FAMILY_SHEARWATER_PETREL;
+}
+
+dc_status_t list_device_dives(device_data_t *data, dc_manifest_callback_t callback, void *userdata) {
+    if (!device_supports_dive_selection(data)) return DC_STATUS_UNSUPPORTED;
+    return shearwater_petrel_device_list(data->device, callback, userdata);
+}
+
+dc_status_t set_device_dive_selection(device_data_t *data, const unsigned char *fingerprints, unsigned int count) {
+    if (!device_supports_dive_selection(data)) return DC_STATUS_UNSUPPORTED;
+    return shearwater_petrel_device_set_selection(data->device, fingerprints, count);
+}
