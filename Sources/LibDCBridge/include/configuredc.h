@@ -177,6 +177,37 @@ dc_status_t create_parser_for_device(dc_parser_t **parser, dc_context_t *context
     dc_family_t family, unsigned int model, const unsigned char *data, size_t size);
 
 /*--------------------------------------------------------------------
+ * Dive Selection
+ *------------------------------------------------------------------*/
+/**
+ * Called once per dive listed by list_device_dives (newest first)
+ * @return non-zero to continue, 0 to stop
+ */
+typedef int (*dc_manifest_callback_t)(const unsigned char *fingerprint,
+                                      unsigned int fsize,
+                                      void *userdata);
+
+/**
+ * Whether the opened device can list its dives and download a selection
+ * (currently Shearwater Petrel family: Petrel, Perdix, Teric, Peregrine, ...)
+ */
+bool device_supports_dive_selection(device_data_t *data);
+
+/**
+ * Lists the fingerprints of all dives on the device without downloading
+ * dive data. Ignores the stored fingerprint. Blocking.
+ * @return DC_STATUS_UNSUPPORTED if the device family has no dive selection
+ */
+dc_status_t list_device_dives(device_data_t *data, dc_manifest_callback_t callback, void *userdata);
+
+/**
+ * Restricts the next dc_device_foreach to the given dives
+ * @param fingerprints: count fingerprints, concatenated
+ * @param count: number of fingerprints, 0 clears the selection
+ */
+dc_status_t set_device_dive_selection(device_data_t *data, const unsigned char *fingerprints, unsigned int count);
+
+/*--------------------------------------------------------------------
  * Utility Functions
  *------------------------------------------------------------------*/
 /**

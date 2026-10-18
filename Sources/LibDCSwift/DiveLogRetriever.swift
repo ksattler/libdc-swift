@@ -18,10 +18,6 @@ public class DiveLogRetriever {
         var logCount: Int = 1
         let viewModel: DiveDataViewModel
         var lastFingerprint: Data?
-        /// Fingerprint of the most recently processed dive (the oldest of all dives downloaded
-        /// so far). Used to save a partial fingerprint on IO-abort so the next connection skips
-        /// already-downloaded dives and avoids re-requesting the failing slot.
-        var lastDownloadedFingerprint: Data?
         let deviceName: String
         let deviceUUID: String
         var deviceSerial: String?
@@ -46,6 +42,11 @@ public class DiveLogRetriever {
         /// isn't cut short by the fingerprint match early-return below.
         let useFingerprint: Bool
 
+        /// True when only a user-selected subset of dives is downloaded. The stored
+        /// fingerprint is then neither used as stop marker nor updated, so the
+        /// regular "new dives" download keeps working afterwards.
+        var isSelectiveDownload: Bool = false
+        
         var detectedFamily: dc_family_t = DC_FAMILY_NULL
         var detectedModel: UInt32 = 0
 
@@ -215,7 +216,7 @@ public class DiveLogRetriever {
         }
         
         // Check if this dive matches our stored fingerprint (already downloaded)
-        if let storedFingerprint = context.storedFingerprint {
+        if !context.isSelectiveDownload, let storedFingerprint = context.storedFingerprint {
             if storedFingerprint == fingerprintData {
                 logInfo("✨ Found matching fingerprint - all new dives downloaded")
                 context.fingerprintMatched = true
@@ -354,6 +355,7 @@ public class DiveLogRetriever {
             bluetoothManager: CoreBluetoothManager,
             syncClock: Bool = false,
             useFingerprint: Bool = true,
+            selection: [Data]? = nil,
             onProgress: ((Int, Int) -> Void)? = nil,
             completion: @escaping (Bool) -> Void
         ) {
@@ -408,7 +410,22 @@ public class DiveLogRetriever {
                     useFingerprint: useFingerprint
                 )
                 context.devicePtr = devicePtr
-                
+                context.isSelectiveDownload = selection != nil
+
+                if let selection {
+                    // An empty selection would clear the filter and download everything.
+                    let status = selection.isEmpty ? DC_STATUS_INVALIDARGS : selection.reduce(Data(), +).withUnsafeBytes { raw in
+                        set_device_dive_selection(devicePtr, raw.bindMemory(to: UInt8.self).baseAddress, UInt32(selection.count))
+                    }
+                    guard status == DC_STATUS_SUCCESS else {
+                        DispatchQueue.main.async {
+                            viewModel.setDetailedError("Tauchgangsauswahl wird von diesem Gerät nicht unterstützt", status: status)
+                            completion(false)
+                        }
+                        return
+                    }
+                }
+
                 let contextPtr = UnsafeMutableRawPointer(Unmanaged.passRetained(context).toOpaque())
                 
                 // Timer requires an active RunLoop on the current thread to fire, and
@@ -434,7 +451,15 @@ public class DiveLogRetriever {
                     dc_device_set_fingerprint(dcDevice, nil, 0)
                 }
                 
+                if let selection {
+                    logInfo("🎯 Selective download of \(selection.count) dive(s): \(selection.map { $0.map { String(format: "%02x", $0) }.joined() })")
+                }
                 let enumStatus = dc_device_foreach(dcDevice, diveCallbackClosure, contextPtr)
+                logInfo("dc_device_foreach finished: status \(enumStatus.rawValue), dives parsed: \(context.logCount - 1)")
+
+                if selection != nil {
+                    _ = set_device_dive_selection(devicePtr, nil, 0)
+                }
 
                 // Log errors for debugging
                 if enumStatus != DC_STATUS_SUCCESS && enumStatus != DC_STATUS_PROTOCOL {
@@ -486,7 +511,9 @@ public class DiveLogRetriever {
                                                            hadStoredFingerprint: context.storedFingerprint != nil,
                                                            emptyReadCount: context.emptyReadCount)
                     let downloadSucceeded = outcome.succeeded
-                    let shouldSaveFingerprint = outcome.saveFingerprint
+                    // A selective download must neither advance nor reset the fingerprint,
+                    // so the regular "new dives" download keeps working afterwards.
+                    let shouldSaveFingerprint = outcome.saveFingerprint && !context.isSelectiveDownload
                     let emptyReadOnly = outcome.emptyReadOnly
                     markRetrievalFinished(bluetoothManager)
 
@@ -553,6 +580,48 @@ public class DiveLogRetriever {
             }
         }
 
+    // MARK: - Dive selection
+
+    /// Whether the opened device can list its dives and download a subset of them
+    /// (currently the Shearwater Petrel family: Petrel, Perdix, Teric, Peregrine, ...).
+    public static func supportsDiveSelection(_ devicePtr: UnsafeMutablePointer<device_data_t>) -> Bool {
+        device_supports_dive_selection(devicePtr)
+    }
+
+    private static let manifestCallback: @convention(c) (
+        UnsafePointer<UInt8>?,
+        UInt32,
+        UnsafeMutableRawPointer?
+    ) -> Int32 = { fingerprint, fsize, userdata in
+        guard let fingerprint, let userdata else { return 0 }
+        let box = Unmanaged<ManifestBox>.fromOpaque(userdata).takeUnretainedValue()
+        if let entry = DeviceDiveEntry(fingerprint: Data(bytes: fingerprint, count: Int(fsize))) {
+            box.entries.append(entry)
+        }
+        return 1
+    }
+
+    private final class ManifestBox {
+        var entries: [DeviceDiveEntry] = []
+    }
+
+    /// Reads the list of dives stored on the device (newest first) without downloading
+    /// dive data. Ignores the stored fingerprint, so already downloaded dives are listed too.
+    /// Blocking — call off the main thread. Pass the selected entries' `fingerprint`s
+    /// to `retrieveDiveLogs(selection:)`.
+    public static func listDives(from devicePtr: UnsafeMutablePointer<device_data_t>) -> Result<[DeviceDiveEntry], DeviceDiveListError> {
+        guard supportsDiveSelection(devicePtr) else { return .failure(.unsupported) }
+        let box = ManifestBox()
+        let status = withExtendedLifetime(box) {
+            list_device_dives(devicePtr, manifestCallback, Unmanaged.passUnretained(box).toOpaque())
+        }
+        guard status == DC_STATUS_SUCCESS else {
+            logError("❌ Listing dives failed: \(status)")
+            return .failure(.status(status))
+        }
+        return .success(box.entries)
+    }
+
     public static func getCurrentContext() -> CallbackContext? {
         return currentContext
     }
@@ -570,4 +639,35 @@ public class DiveLogRetriever {
     static func markRetrievalFinished(_ holder: RetrievalFlagHolder) {
         holder.isRetrievingLogs = false
     }
+}
+
+
+/// A dive stored on the dive computer, as listed by `DiveLogRetriever.listDives(from:)`.
+public struct DeviceDiveEntry: Identifiable, Hashable {
+    /// libdivecomputer fingerprint — identifies the dive for `retrieveDiveLogs(selection:)`.
+    public let fingerprint: Data
+    /// Start time, built like `GenericParser` builds `DiveData.datetime`, so it can be
+    /// matched against already downloaded dives.
+    public let datetime: Date
+
+    public var id: Data { fingerprint }
+
+    /// Shearwater fingerprints are the dive's start time as 32-bit big-endian
+    /// device ticks (seconds since 1970 in the computer's local time).
+    init?(fingerprint: Data) {
+        guard fingerprint.count == 4 else { return nil }
+        let ticks = fingerprint.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let components = utc.dateComponents([.year, .month, .day, .hour, .minute, .second],
+                                            from: Date(timeIntervalSince1970: TimeInterval(ticks)))
+        guard let date = Calendar(identifier: .gregorian).date(from: components) else { return nil }
+        self.fingerprint = fingerprint
+        self.datetime = date
+    }
+}
+
+public enum DeviceDiveListError: Error {
+    case unsupported
+    case status(dc_status_t)
 }
