@@ -591,7 +591,8 @@ public class DiveLogRetriever {
     // MARK: - Dive selection
 
     /// Whether the opened device can list its dives and download a subset of them
-    /// (currently the Shearwater Petrel family: Petrel, Perdix, Teric, Peregrine, ...).
+    /// (Shearwater Petrel family: Petrel, Perdix, Teric, Peregrine, ...;
+    /// Heinrichs Weikamp OSTC 3/4/5/Plus/Sport/2/Frog).
     public static func supportsDiveSelection(_ devicePtr: UnsafeMutablePointer<device_data_t>) -> Bool {
         device_supports_dive_selection(devicePtr)
     }
@@ -599,11 +600,13 @@ public class DiveLogRetriever {
     private static let manifestCallback: @convention(c) (
         UnsafePointer<UInt8>?,
         UInt32,
+        UnsafePointer<dc_datetime_t>?,
         UnsafeMutableRawPointer?
-    ) -> Int32 = { fingerprint, fsize, userdata in
+    ) -> Int32 = { fingerprint, fsize, datetime, userdata in
         guard let fingerprint, let userdata else { return 0 }
         let box = Unmanaged<ManifestBox>.fromOpaque(userdata).takeUnretainedValue()
-        if let entry = DeviceDiveEntry(fingerprint: Data(bytes: fingerprint, count: Int(fsize))) {
+        if let entry = DeviceDiveEntry(fingerprint: Data(bytes: fingerprint, count: Int(fsize)),
+                                       datetime: datetime?.pointee) {
             box.entries.append(entry)
         }
         return 1
@@ -660,9 +663,23 @@ public struct DeviceDiveEntry: Identifiable, Hashable {
 
     public var id: Data { fingerprint }
 
-    /// Shearwater fingerprints are the dive's start time as 32-bit big-endian
-    /// device ticks (seconds since 1970 in the computer's local time).
-    init?(fingerprint: Data) {
+    /// `datetime` is the start time reported by the bridge (OSTC). Without it the
+    /// fingerprint is decoded as a Shearwater fingerprint: the dive's start time as
+    /// 32-bit big-endian device ticks (seconds since 1970 in the computer's local time).
+    init?(fingerprint: Data, datetime: dc_datetime_t?) {
+        if let datetime {
+            var components = DateComponents()
+            components.year = Int(datetime.year)
+            components.month = Int(datetime.month)
+            components.day = Int(datetime.day)
+            components.hour = Int(datetime.hour)
+            components.minute = Int(datetime.minute)
+            components.second = Int(datetime.second)
+            guard let date = Calendar(identifier: .gregorian).date(from: components) else { return nil }
+            self.fingerprint = fingerprint
+            self.datetime = date
+            return
+        }
         guard fingerprint.count == 4 else { return nil }
         let ticks = fingerprint.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
         var utc = Calendar(identifier: .gregorian)

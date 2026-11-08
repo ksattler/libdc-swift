@@ -181,15 +181,20 @@ dc_status_t create_parser_for_device(dc_parser_t **parser, dc_context_t *context
  *------------------------------------------------------------------*/
 /**
  * Called once per dive listed by list_device_dives (newest first)
+ * @param datetime: start of the dive as decoded by the family's parser
+ *                  (local wall clock), or NULL if the family doesn't report it
+ *                  (Shearwater: the fingerprint itself is the start time)
  * @return non-zero to continue, 0 to stop
  */
 typedef int (*dc_manifest_callback_t)(const unsigned char *fingerprint,
                                       unsigned int fsize,
+                                      const dc_datetime_t *datetime,
                                       void *userdata);
 
 /**
  * Whether the opened device can list its dives and download a selection
- * (currently Shearwater Petrel family: Petrel, Perdix, Teric, Peregrine, ...)
+ * (Shearwater Petrel family: Petrel, Perdix, Teric, Peregrine, ...;
+ * Heinrichs Weikamp OSTC 3/4/5/Plus/Sport/2/Frog)
  */
 bool device_supports_dive_selection(device_data_t *data);
 

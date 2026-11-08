@@ -795,18 +795,37 @@ dc_status_t open_ble_device_with_identification(device_data_t **out_data,
  * Dive selection
  *------------------------------------------------------------------*/
 #include "shearwater_petrel.h"
+#include "hw_ostc3.h"
 
 bool device_supports_dive_selection(device_data_t *data) {
     if (!data || !data->device) return false;
-    return dc_device_get_type(data->device) == DC_FAMILY_SHEARWATER_PETREL;
+    dc_family_t family = dc_device_get_type(data->device);
+    return family == DC_FAMILY_SHEARWATER_PETREL || family == DC_FAMILY_HW_OSTC3;
+}
+
+typedef struct {
+    dc_manifest_callback_t callback;
+    void *userdata;
+} manifest_forward_t;
+
+static int shearwater_manifest_forward(const unsigned char *fingerprint, unsigned int fsize, void *userdata) {
+    manifest_forward_t *forward = (manifest_forward_t *)userdata;
+    return forward->callback(fingerprint, fsize, NULL, forward->userdata);
 }
 
 dc_status_t list_device_dives(device_data_t *data, dc_manifest_callback_t callback, void *userdata) {
-    if (!device_supports_dive_selection(data)) return DC_STATUS_UNSUPPORTED;
-    return shearwater_petrel_device_list(data->device, callback, userdata);
+    if (!device_supports_dive_selection(data) || !callback) return DC_STATUS_UNSUPPORTED;
+    if (dc_device_get_type(data->device) == DC_FAMILY_HW_OSTC3) {
+        return hw_ostc3_device_list(data->device, callback, userdata);
+    }
+    manifest_forward_t forward = { callback, userdata };
+    return shearwater_petrel_device_list(data->device, shearwater_manifest_forward, &forward);
 }
 
 dc_status_t set_device_dive_selection(device_data_t *data, const unsigned char *fingerprints, unsigned int count) {
     if (!device_supports_dive_selection(data)) return DC_STATUS_UNSUPPORTED;
+    if (dc_device_get_type(data->device) == DC_FAMILY_HW_OSTC3) {
+        return hw_ostc3_device_set_selection(data->device, fingerprints, count);
+    }
     return shearwater_petrel_device_set_selection(data->device, fingerprints, count);
 }
