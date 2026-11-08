@@ -230,6 +230,14 @@ device_data_t* get_device_data_pointer(void);
  */
 void set_ble_debug_logging(int enabled);
 
+/**
+ * Receives libdivecomputer's log messages (level is a dc_loglevel_t) instead
+ * of printing them to stdout. Pass NULL to print again. May be called from
+ * any thread.
+ */
+typedef void (*libdc_log_handler_t)(int level, const char *message);
+void set_libdc_log_handler(libdc_log_handler_t handler);
+
 #ifdef __cplusplus
 }
 #endif

@@ -209,6 +209,11 @@ public class DiveLogRetriever {
         
         let fingerprintData = Data(bytes: fingerprint, count: Int(fsize))
 
+        if let directory = rawDiveDirectory {
+            saveRawDive(Data(bytes: data, count: Int(size)), fingerprint: fingerprintData,
+                        family: context.detectedFamily, model: context.detectedModel, to: directory)
+        }
+
         // Capture the FIRST dive's fingerprint (most recent dive on the device)
         // This is what we'll compare against on the next download
         if context.logCount == 1 {
@@ -587,6 +592,25 @@ public class DiveLogRetriever {
                 currentContext = context
             }
         }
+
+    // MARK: - Raw dive export
+
+    /// When set, every dive received from the device is written unparsed to this
+    /// directory as `<family>_<model>_<fingerprint>.bin` (diagnostics, e.g. to
+    /// replay a dive through the parser offline). Set before `retrieveDiveLogs`.
+    public static var rawDiveDirectory: URL?
+
+    private static func saveRawDive(_ data: Data, fingerprint: Data, family: dc_family_t, model: UInt32, to directory: URL) {
+        let hex = fingerprint.map { String(format: "%02x", $0) }.joined()
+        let name = String(format: "%u_%u_%@.bin", family.rawValue, model, hex)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: directory.appendingPathComponent(name), options: .atomic)
+            logInfo("Raw dive saved: \(name) (\(data.count) bytes)")
+        } catch {
+            logError("Saving raw dive \(name) failed: \(error.localizedDescription)")
+        }
+    }
 
     // MARK: - Dive selection
 

@@ -1,4 +1,6 @@
 import Foundation
+import Clibdivecomputer
+import LibDCBridge
 
 public enum LogLevel: Int {
     case debug = 0
@@ -88,6 +90,18 @@ public class Logger {
     private init() {
         isEnabled = true
         minLevel = .debug
+        // Route libdivecomputer's own messages (e.g. driver/parser warnings)
+        // through this logger so onLog sinks receive them too.
+        set_libdc_log_handler { level, message in
+            guard let message else { return }
+            let text = "[libdc] " + String(cString: message)
+            switch dc_loglevel_t(rawValue: UInt32(level)) {
+            case DC_LOGLEVEL_ERROR: Logger.shared.log(text, level: .error, file: "libdivecomputer")
+            case DC_LOGLEVEL_WARNING: Logger.shared.log(text, level: .warning, file: "libdivecomputer")
+            case DC_LOGLEVEL_INFO: Logger.shared.log(text, level: .info, file: "libdivecomputer")
+            default: Logger.shared.log(text, level: .debug, file: "libdivecomputer")
+            }
+        }
     }
     
     public func log(_ message: String, level: LogLevel = .debug, file: String = #file, function: String = #function) {

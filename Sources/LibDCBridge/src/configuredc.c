@@ -346,7 +346,19 @@ static void close_device_data(device_data_t *data) {
 // elsewhere in this file. Without this, a protocol-level validation failure
 // in e.g. shearwater_common.c only ever surfaces as a bare DC_STATUS_PROTOCOL,
 // with no indication of which specific check failed or why.
+static libdc_log_handler_t g_log_handler = NULL;
+
+void set_libdc_log_handler(libdc_log_handler_t handler) {
+    g_log_handler = handler;
+}
+
 static void dc_log_callback(dc_context_t *context, dc_loglevel_t loglevel, const char *file, unsigned int line, const char *function, const char *message, void *userdata) {
+    if (g_log_handler) {
+        char buffer[1024];
+        snprintf(buffer, sizeof(buffer), "%s:%d %s(): %s", file, line, function, message);
+        g_log_handler((int)loglevel, buffer);
+        return;
+    }
     const char *level = "?";
     switch (loglevel) {
         case DC_LOGLEVEL_ERROR:   level = "ERROR"; break;
