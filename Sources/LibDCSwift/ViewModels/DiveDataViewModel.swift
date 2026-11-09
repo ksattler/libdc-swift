@@ -136,13 +136,54 @@ public class DiveDataViewModel: ObservableObject {
             logWarning("⚠️ Attempted to save empty fingerprint - ignoring")
             return
         }
-        
+
+        if defersFingerprintCommit {
+            pendingFingerprint = PendingFingerprint(fingerprint: fingerprint, deviceType: deviceType, serial: serial)
+            logInfo("Fingerprint held back until the app has stored the dives")
+            return
+        }
+
         DeviceFingerprintStorage.shared.saveFingerprint(
             fingerprint,
             deviceType: deviceType,
             serial: serial
         )
         objectWillChange.send()
+    }
+
+    // MARK: - Deferred fingerprint
+
+    private struct PendingFingerprint {
+        let fingerprint: Data
+        let deviceType: String
+        let serial: String
+    }
+
+    /// When true, a download's new fingerprint is only held back and must be
+    /// stored with `commitPendingFingerprint()` once the app has persisted the
+    /// dives. Otherwise a failed save would still advance the fingerprint and
+    /// the next incremental download would skip the unsaved dives for good.
+    public var defersFingerprintCommit = false
+    private var pendingFingerprint: PendingFingerprint?
+
+    /// Stores the fingerprint held back by the last download (if any).
+    public func commitPendingFingerprint() {
+        guard let pending = pendingFingerprint else { return }
+        pendingFingerprint = nil
+        DeviceFingerprintStorage.shared.saveFingerprint(
+            pending.fingerprint,
+            deviceType: pending.deviceType,
+            serial: pending.serial
+        )
+        objectWillChange.send()
+    }
+
+    /// Drops the held-back fingerprint, e.g. after the dives couldn't be saved.
+    public func discardPendingFingerprint() {
+        if pendingFingerprint != nil {
+            logWarning("Fingerprint discarded: dives were not stored")
+        }
+        pendingFingerprint = nil
     }
     
     /// Clears the stored fingerprint for a specific device

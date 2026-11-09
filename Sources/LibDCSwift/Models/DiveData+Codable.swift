@@ -347,6 +347,7 @@ extension DiveData: Codable {
         case salinity, atmospheric, surfaceTemperature, minTemperature, maxTemperature
         case tankCount, tanks, diveMode, decoModel, location
         case rbt, heartbeat, bearing, setpoint, ppo2Readings, cns, decoStop
+        case reportedDivetime
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -378,6 +379,7 @@ extension DiveData: Codable {
         try container.encodeIfPresent(setpoint, forKey: .setpoint)
         try container.encodeIfPresent(cns, forKey: .cns)
         try container.encodeIfPresent(decoStop, forKey: .decoStop)
+        try container.encodeIfPresent(reportedDivetime, forKey: .reportedDivetime)
 
         let readings = ppo2Readings.map { PPO2Reading(sensor: $0.sensor, value: $0.value) }
         try container.encode(readings, forKey: .ppo2Readings)
@@ -415,7 +417,8 @@ extension DiveData: Codable {
             setpoint: try container.decodeIfPresent(Double.self, forKey: .setpoint),
             ppo2Readings: readings.map { (sensor: $0.sensor, value: $0.value) },
             cns: try container.decodeIfPresent(Double.self, forKey: .cns),
-            decoStop: try container.decodeIfPresent(DecoStop.self, forKey: .decoStop)
+            decoStop: try container.decodeIfPresent(DecoStop.self, forKey: .decoStop),
+            reportedDivetime: try container.decodeIfPresent(TimeInterval.self, forKey: .reportedDivetime)
         )
     }
 }

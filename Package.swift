@@ -122,7 +122,8 @@ let package = Package(
             path: "Tests/LibDCSwiftTests",
             resources: [
                 .copy("Fixtures/suunto_nautic_1787752091.sbem"),
-                .copy("Fixtures/logbook_entries_multi.bin")
+                .copy("Fixtures/logbook_entries_multi.bin"),
+                .copy("Fixtures/ostc5_ble_loss_1a0b08093a.bin")
             ]
         )
     ]

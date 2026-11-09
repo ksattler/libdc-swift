@@ -391,6 +391,13 @@ public struct DiveData: Identifiable {
     public var avgDepth: Double
     public var divetime: TimeInterval
     public var temperature: Double
+
+    /// Dive time as stated by the computer (DC_FIELD_DIVETIME), before the
+    /// parser reconciles it with the samples. `divetime` falls back to the
+    /// sample span when the stated time is longer, which would hide samples
+    /// lost in transfer; this keeps the original for `isProfileIncomplete`.
+    /// `nil` for dives not parsed from a computer (or stored before this field).
+    public var reportedDivetime: TimeInterval?
     
     // Profile data
     public var profile: [DiveProfilePoint] 
@@ -613,7 +620,8 @@ public struct DiveData: Identifiable {
         cns: Double?,
         decoStop: DecoStop?,
         fingerprint: Data? = nil,
-        vendorSamples: [VendorSample] = []
+        vendorSamples: [VendorSample] = [],
+        reportedDivetime: TimeInterval? = nil
     ) {
         self.number = number
         self.datetime = datetime
@@ -645,5 +653,23 @@ public struct DiveData: Identifiable {
         self.decoStop = decoStop
         self.fingerprint = fingerprint
         self.vendorSamples = vendorSamples
+        self.reportedDivetime = reportedDivetime
+    }
+}
+
+public extension DiveData {
+    /// Time covered by the profile (time of the last sample).
+    var profileSpan: TimeInterval {
+        profile.last?.time ?? 0
+    }
+
+    /// True when the computer states a clearly longer dive than the profile
+    /// covers: samples were lost on the way (e.g. OSTC 5 over BLE drops whole
+    /// blocks while the stream still ends with a valid end marker). The margin
+    /// (3 min and 15 %) absorbs dive times stored in whole minutes and short
+    /// surface phases that some computers count but don't sample.
+    var isProfileIncomplete: Bool {
+        guard let reported = reportedDivetime, reported > 0, !profile.isEmpty else { return false }
+        return reported - profileSpan > max(180, reported * 0.15)
     }
 }

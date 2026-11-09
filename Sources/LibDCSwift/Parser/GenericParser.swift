@@ -390,7 +390,8 @@ public class GenericParser {
         }
         wrapper.finish()
 
-        let divetime = resolveDivetime(field: getField(parser, type: DC_FIELD_DIVETIME), sampleSpan: wrapper.data.maxTime)
+        let reportedDivetime: UInt32? = getField(parser, type: DC_FIELD_DIVETIME)
+        let divetime = resolveDivetime(field: reportedDivetime, sampleSpan: wrapper.data.maxTime)
         let avgDepth = resolveAverageDepth(
             field: getField(parser, type: DC_FIELD_AVGDEPTH),
             maxDepth: wrapper.data.maxDepth,
@@ -505,7 +506,7 @@ public class GenericParser {
             profile: wrapper.data.profile,
             gasMixCount: wrapper.data.gasMixes.count)
 
-        return DiveData(
+        let dive = DiveData(
             number: diveNumber,
             datetime: date,
             maxDepth: maxDepth,
@@ -541,8 +542,13 @@ public class GenericParser {
                 )
             },
             fingerprint: fingerprint,
-            vendorSamples: wrapper.data.vendorSamples
+            vendorSamples: wrapper.data.vendorSamples,
+            reportedDivetime: reportedDivetime.map { TimeInterval($0) }
         )
+        if dive.isProfileIncomplete {
+            logWarning("Profile incomplete: covers \(Int(dive.profileSpan)) s of \(Int(dive.reportedDivetime ?? 0)) s dive time")
+        }
+        return dive
     }
 
     /// Last-sample time overcounts on computers that keep logging at the
